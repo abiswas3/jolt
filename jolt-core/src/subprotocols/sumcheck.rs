@@ -731,10 +731,8 @@ impl<F: JoltField, ProofTranscript: Transcript> SumcheckInstanceProof<F, ProofTr
                     self.compressed_polys[i].degree(),
                 ));
             }
-
             // append the prover's message to the transcript
             self.compressed_polys[i].append_to_transcript(transcript);
-
             //derive the verifier's challenge for the next round
             let r_i = transcript.challenge_scalar();
             r.push(r_i);

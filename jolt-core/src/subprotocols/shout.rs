@@ -292,6 +292,188 @@ impl<F: JoltField, ProofTranscript: Transcript> ShoutProof<F, ProofTranscript> {
     }
 }
 
+// Helper function to compute N = K^{1/d}
+fn root_or_panic_float(k: u128, d: u32) -> u128 {
+    assert!(d > 0, "d must be greater than 0");
+    let n_float = (k as f64).powf(1.0 / d as f64);
+    let n = n_float.round() as u128;
+    if n.pow(d) != k {
+        panic!("{k} is not a perfect {d}th power");
+    }
+
+    if !n.is_power_of_two() {
+        panic!("{k} is a perfect {d}th power but not a power of 2");
+    }
+    n
+}
+
+/// Implements the sumcheck prover for the generic core Shout PIOP for d=1.
+/// See Figure 7 of https://eprint.iacr.org/2025/105
+pub fn prove_generic_core_shout_pip<F: JoltField, ProofTranscript: Transcript>(
+    lookup_table: Vec<F>,
+    read_addresses: Vec<usize>,
+    _d: u32,
+    transcript: &mut ProofTranscript,
+) -> (
+    SumcheckInstanceProof<F, ProofTranscript>,
+    Vec<F>,
+    F,
+    F,
+    F,
+    F,
+) {
+    // This assumes that K and T are powers of 2
+    let K = lookup_table.len();
+    let T = read_addresses.len();
+
+    // A random field element F^{\log_2 T} for Schwartz-Zippll
+    // This is stored in Big Endian
+    let r_cycle: Vec<F> = transcript.challenge_vector(T.log_2());
+    // Page 50: eq(44)
+    let E_star: Vec<F> = EqPolynomial::evals(&r_cycle);
+    // Page 50: eq(47) : what the paper calls v_k
+    let C: Vec<_> = (0..K) // This is C[x] = ra(r_cycle, x)
+        .into_par_iter()
+        .map(|k| {
+            read_addresses
+                .iter()
+                .enumerate()
+                .filter_map(|(cycle, address)| {
+                    if *address == k {
+                        // this check will be more complex for d > 1 but let's keep
+                        // this for now
+                        Some(E_star[cycle])
+                    } else {
+                        None
+                    }
+                })
+                .sum::<F>()
+        })
+        .collect();
+
+    let num_rounds = K.log_2() + T.log_2();
+    // The vector storing the verifiers sum-check challenges
+    let mut r_address: Vec<F> = Vec::with_capacity(num_rounds);
+
+    // The sum check answer (for d=1, it's the same as normal one)
+    let sumcheck_claim: F = C
+        .par_iter()
+        .zip(lookup_table.par_iter())
+        .map(|(&ra, &val)| ra * val)
+        .sum();
+
+    let mut previous_claim = sumcheck_claim;
+
+    // These are the polynomials the prover commits to
+    let mut ra = MultilinearPolynomial::from(C);
+    let mut val = MultilinearPolynomial::from(lookup_table);
+
+    // Binding the first log_2 K variables
+    const DEGREE: usize = 2;
+    let mut compressed_polys: Vec<CompressedUniPoly<F>> = Vec::with_capacity(num_rounds);
+    for _ in 0..K.log_2() {
+        // Page 51: (eq 51)
+        let univariate_poly_evals: [F; DEGREE] = (0..ra.len() / 2)
+            .into_par_iter()
+            .map(|index| {
+                let ra_evals = ra.sumcheck_evals(index, DEGREE, BindingOrder::LowToHigh);
+                let val_evals = val.sumcheck_evals(index, DEGREE, BindingOrder::LowToHigh);
+                [ra_evals[0] * val_evals[0], ra_evals[1] * val_evals[1]] // since DEGREE=2
+            })
+            .reduce(
+                || [F::zero(); DEGREE],
+                |running, new| [running[0] + new[0], running[1] + new[1]],
+            );
+
+        // Construct coefficients of univariate polynomial from evaluations
+        // No Gruen optimisation here
+        let univariate_poly = UniPoly::from_evals(&[
+            univariate_poly_evals[0],
+            previous_claim - univariate_poly_evals[0],
+            univariate_poly_evals[1],
+        ]);
+        let compressed_poly = univariate_poly.compress();
+        compressed_poly.append_to_transcript(transcript);
+        compressed_polys.push(compressed_poly);
+
+        // Get challenge that binds the variable
+        let r_j = transcript.challenge_scalar::<F>();
+        r_address.push(r_j);
+
+        previous_claim = univariate_poly.evaluate(&r_j);
+
+        rayon::join(
+            || ra.bind_parallel(r_j, BindingOrder::LowToHigh),
+            || val.bind_parallel(r_j, BindingOrder::LowToHigh),
+        );
+    }
+
+    // tau = r_address (the verifiers challenges which bind all log K variables of memory)
+    // This is \widetilde{Val}(\tau) from the paper (eq 52)
+    let val_claim = val.final_sumcheck_claim();
+
+    // At this point we should have bound the first log K variables
+    // Binding the second log T variables
+    let mut eq_r_cycle = MultilinearPolynomial::from(E_star);
+    // Endian issue
+    let mut r_address_reversed = r_address.clone();
+    r_address_reversed.reverse();
+    let eq_tau: Vec<F> = EqPolynomial::evals(&r_address_reversed); // This log K and r_cycle was \log T isn't it?
+    let mut E = vec![F::zero(); T]; // When d > 1 there will be d of these arrays
+    E.par_iter_mut().enumerate().for_each(|(y, e)| {
+        *e = eq_tau[read_addresses[y]];
+    });
+    let mut ra_tau = MultilinearPolynomial::from(E);
+
+    for _ in 0..T.log_2() {
+        let univariate_poly_evals: [F; 2] = (0..ra_tau.len() / 2)
+            .into_par_iter()
+            .map(|index| {
+                let ra_evals = ra_tau.sumcheck_evals(index, 2, BindingOrder::LowToHigh);
+                let val_evals = eq_r_cycle.sumcheck_evals(index, 2, BindingOrder::LowToHigh);
+                [ra_evals[0] * val_evals[0], ra_evals[1] * val_evals[1]]
+            })
+            .reduce(
+                || [F::zero(); 2],
+                |running, new| [running[0] + new[0], running[1] + new[1]],
+            );
+
+        // Construct coefficients of univariate polynomial from evaluations
+        let univariate_poly = UniPoly::from_evals(&[
+            val_claim * univariate_poly_evals[0],
+            previous_claim - val_claim * univariate_poly_evals[0],
+            val_claim * univariate_poly_evals[1],
+        ]);
+        // Skip the linear term when storing coeffs as we can always re-construct it
+        let compressed_poly = univariate_poly.compress();
+        compressed_poly.append_to_transcript(transcript);
+        compressed_polys.push(compressed_poly);
+
+        // Get challenge that binds the variable
+        let r_j = transcript.challenge_scalar::<F>();
+        r_address.push(r_j);
+
+        previous_claim = univariate_poly.evaluate(&r_j);
+
+        rayon::join(
+            || ra_tau.bind_parallel(r_j, BindingOrder::LowToHigh),
+            || eq_r_cycle.bind_parallel(r_j, BindingOrder::LowToHigh),
+        );
+    }
+
+    // This is wrong : we need to multiply by Vals(Tau)
+    let ra_tau_claim = ra_tau.final_sumcheck_claim();
+    let eq_r_cycle_at_r_time = eq_r_cycle.final_sumcheck_claim();
+    (
+        SumcheckInstanceProof::new(compressed_polys),
+        r_address,
+        sumcheck_claim, // These two are currently wrong
+        ra_tau_claim,
+        val_claim,
+        eq_r_cycle_at_r_time,
+    )
+}
+
 /// Implements the sumcheck prover for the core Shout PIOP when d = 1. See
 /// Figure 5 from the Twist+Shout paper.
 pub fn prove_core_shout_piop<F: JoltField, ProofTranscript: Transcript>(
@@ -302,6 +484,8 @@ pub fn prove_core_shout_piop<F: JoltField, ProofTranscript: Transcript>(
     let K = lookup_table.len();
     let T = read_addresses.len();
     let r_cycle: Vec<F> = transcript.challenge_vector(T.log_2());
+    //let log_T = T.log_2();
+    //let r_cycle = vec![F::from_u8(10); log_T];
 
     // Sumcheck for the core Shout PIOP (Figure 5)
     let num_rounds = K.log_2();
@@ -359,8 +543,7 @@ pub fn prove_core_shout_piop<F: JoltField, ProofTranscript: Transcript>(
         r_address.push(r_j);
 
         previous_claim = univariate_poly.evaluate(&r_j);
-
-        // Bind polynomials
+        println!("Previous Claim: {previous_claim}");
         rayon::join(
             || ra.bind_parallel(r_j, BindingOrder::LowToHigh),
             || val.bind_parallel(r_j, BindingOrder::LowToHigh),
@@ -368,6 +551,7 @@ pub fn prove_core_shout_piop<F: JoltField, ProofTranscript: Transcript>(
     }
 
     let ra_claim = ra.final_sumcheck_claim();
+    println!("Final ra_claim: {ra_claim}");
     (
         SumcheckInstanceProof::new(compressed_polys),
         r_address,
@@ -1308,25 +1492,187 @@ mod tests {
             .map(|_| rng.next_u32() as usize % TABLE_SIZE)
             .collect();
 
+        let table_size = lookup_table.len(); // T
+        let num_lookups = read_addresses.len(); // K
+        let ra: Vec<Vec<Fr>> = read_addresses // T x K one hot encoded matrix
+            .par_iter()
+            .map(|&addr| {
+                (0..table_size)
+                    .into_par_iter()
+                    .map(|j| if j == addr { Fr::one() } else { Fr::zero() })
+                    .collect()
+            })
+            .collect();
+        let flattened: Vec<Fr> = ra
+            .par_iter()
+            .flat_map_iter(|row| row.iter().cloned())
+            .collect();
+        // THESE ARE THE THINGS THE PROVER COMMITS TO
+        // Technically val is not always committed to as the verifier can compute it using
+        // log(K) multiplications where K=|lookuptable|
+        let ra_poly = MultilinearPolynomial::from(flattened);
+        let val = MultilinearPolynomial::from(lookup_table.clone());
+
         let mut prover_transcript = KeccakTranscript::new(b"test_transcript");
-        let (sumcheck_proof, _, sumcheck_claim, _) =
+        let (sumcheck_proof, _vfr_challenges, sumcheck_claim, sum_check_oracle_eval) =
             prove_core_shout_piop(lookup_table, read_addresses, &mut prover_transcript);
 
         let mut verifier_transcript = KeccakTranscript::new(b"test_transcript");
         verifier_transcript.compare_to(prover_transcript);
 
-        let _r_cycle: Vec<Fr> = verifier_transcript.challenge_vector(NUM_LOOKUPS.log_2());
+        let r_cycle: Vec<Fr> = verifier_transcript.challenge_vector(num_lookups.log_2());
         let verification_result = sumcheck_proof.verify(
             sumcheck_claim,
-            TABLE_SIZE.log_2(),
+            table_size.log_2(),
             2,
             &mut verifier_transcript,
         );
-        assert!(
-            verification_result.is_ok(),
-            "Verification failed with error: {:?}",
-            verification_result.err()
+
+        let (final_claim, verifier_challenges) = verification_result.unwrap();
+        let mut r_address = verifier_challenges.to_vec();
+        r_address.reverse();
+        let val_at_r_address = val.evaluate(&r_address);
+
+        // The problem is that when we call EqPoly::eval -- the input is big endian.
+        // so r_cycle = [r_{\log T}, ..., r_1] is actually stored in reverse order.
+        let mut r_cycle_copy = r_cycle.clone();
+        r_cycle_copy.reverse();
+
+        // But the sumcheck challenges is low to high so verifiers challenges is little-endian.
+        let mut full_random_location = verifier_challenges.clone();
+        full_random_location.extend_from_slice(&r_cycle_copy);
+
+        full_random_location.reverse();
+        let ra_evaluated_r_address_r_cycle = ra_poly.evaluate(&full_random_location);
+
+        assert_eq!(ra_evaluated_r_address_r_cycle, sum_check_oracle_eval);
+        // Check if the sumcheck oracle check matches
+        assert_eq!(
+            ra_evaluated_r_address_r_cycle * val_at_r_address,
+            final_claim
         );
+    }
+
+    #[test]
+    fn core_generic_d_is_one_shout_sumcheck() {
+        const TABLE_SIZE: usize = 64; // 2**6
+        const NUM_LOOKUPS: usize = 1 << 10; // 2**10
+        let mut rng = test_rng();
+
+        let lookup_table: Vec<Fr> = (0..TABLE_SIZE).map(|_| Fr::random(&mut rng)).collect();
+        let read_addresses: Vec<usize> = (0..NUM_LOOKUPS)
+            .map(|_| rng.next_u32() as usize % TABLE_SIZE)
+            .collect();
+        let table_size = lookup_table.len();
+        let num_lookups = read_addresses.len();
+
+        let ra: Vec<Vec<Fr>> = read_addresses
+            .par_iter()
+            .map(|&addr| {
+                (0..table_size)
+                    .into_par_iter()
+                    .map(|j| if j == addr { Fr::one() } else { Fr::zero() })
+                    .collect()
+            })
+            .collect();
+
+        let flattened: Vec<Fr> = ra.iter().flat_map(|row| row.iter().cloned()).collect();
+
+        let ra_poly = MultilinearPolynomial::from(flattened);
+        let val = MultilinearPolynomial::from(lookup_table.clone());
+        let mut prover_transcript = KeccakTranscript::new(b"test_transcript");
+        let (
+            sumcheck_proof,
+            _,
+            sumcheck_claim,
+            ra_address_time_claim,
+            val_tau_claim,
+            eq_rcycle_rtime_claim,
+        ) = prove_generic_core_shout_pip(lookup_table, read_addresses, 1, &mut prover_transcript);
+
+        let mut verifier_transcript = KeccakTranscript::new(b"test_transcript");
+        verifier_transcript.compare_to(prover_transcript);
+
+        let r_cycle: Vec<Fr> = verifier_transcript.challenge_vector(num_lookups.log_2());
+        let verification_result = sumcheck_proof.verify(
+            sumcheck_claim,
+            table_size.log_2() + num_lookups.log_2(),
+            2,
+            &mut verifier_transcript,
+        );
+        let (final_claim, verifier_challenges) = verification_result.unwrap();
+        let (r_address, r_time) = verifier_challenges.split_at(table_size.log_2());
+
+        let mut r_address = r_address.to_vec();
+        r_address.reverse();
+        let val_at_r_address = val.evaluate(&r_address);
+
+        let mut full_random_location = verifier_challenges.clone();
+        full_random_location.reverse();
+        let ra_evaluated_r_address_r_time = ra_poly.evaluate(&full_random_location);
+        let eq_r_cycle = MultilinearPolynomial::from(EqPolynomial::evals(&r_cycle));
+        let mut r_time = r_time.to_vec();
+        r_time.reverse();
+        let eq_r_cycle_r_time = eq_r_cycle.evaluate(&r_time);
+
+        assert_eq!(ra_evaluated_r_address_r_time, ra_address_time_claim);
+        assert_eq!(val_at_r_address, val_tau_claim);
+        assert_eq!(eq_r_cycle_r_time, eq_rcycle_rtime_claim);
+
+        // THis is the final opening check
+        assert_eq!(
+            final_claim,
+            ra_evaluated_r_address_r_time * eq_r_cycle_r_time * val_at_r_address
+        );
+    }
+
+    #[test]
+    fn mle_for_ra() {
+        let lookup_table: Vec<Fr> = [Fr::from_u8(8), Fr::from_u8(9)].to_vec();
+        let read_addresses: Vec<usize> = [1, 1, 0, 1].to_vec();
+        let table_size = lookup_table.len();
+        let _num_lookups = read_addresses.len();
+
+        let ra: Vec<Vec<Fr>> = read_addresses
+            .par_iter()
+            .map(|&addr| {
+                (0..table_size)
+                    .into_par_iter()
+                    .map(|j| if j == addr { Fr::one() } else { Fr::zero() })
+                    .collect()
+            })
+            .collect();
+        for (i, row) in ra.iter().enumerate() {
+            println!(
+                "Row {}: [{}]",
+                i,
+                row.iter()
+                    .map(|x| format!("{x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let flattened: Vec<Fr> = ra.iter().flat_map(|row| row.iter().cloned()).collect();
+
+        println!(
+            "Flattened vector: [{}]",
+            flattened
+                .iter()
+                .map(|x| format!("{x}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        let ra_poly = MultilinearPolynomial::from(flattened);
+        let mut location = [Fr::from_u8(9), Fr::from_u8(9), Fr::from_u8(9)].to_vec();
+        location.reverse();
+        let poly_evaluation = ra_poly.evaluate(&location);
+        assert_eq!(poly_evaluation, Fr::from_u32(1233));
+
+        location = [Fr::from_u8(8), Fr::from_u8(9), Fr::from_u8(9)].to_vec();
+        location.reverse();
+        let poly_evaluation = ra_poly.evaluate(&location);
+        assert_eq!(poly_evaluation, Fr::from_u32(1088));
     }
 
     #[test]
