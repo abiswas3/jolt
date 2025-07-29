@@ -292,19 +292,395 @@ impl<F: JoltField, ProofTranscript: Transcript> ShoutProof<F, ProofTranscript> {
     }
 }
 
-// Helper function to compute N = K^{1/d}
-fn root_or_panic_float(k: u128, d: u32) -> u128 {
-    assert!(d > 0, "d must be greater than 0");
-    let n_float = (k as f64).powf(1.0 / d as f64);
-    let n = n_float.round() as u128;
-    if n.pow(d) != k {
-        panic!("{k} is not a perfect {d}th power");
+fn decompose_one_hot_matrix<F: JoltField>(
+    read_addresses: &[usize],
+    table_size: usize,
+    d: usize,
+) -> Vec<Vec<Vec<F>>> {
+    let T = read_addresses.len();
+    let N = (table_size as f64).powf(1.0 / d as f64).round() as usize;
+    assert_eq!(
+        N.pow(d as u32),
+        table_size,
+        "K must be a perfect power of N"
+    );
+
+    // Step 1: compute base-N digits for each address
+    let digits_per_addr: Vec<Vec<usize>> = read_addresses
+        .par_iter()
+        .map(|&addr| {
+            let mut digits = vec![0; d];
+            let mut rem = addr;
+            for j in (0..d).rev() {
+                digits[j] = rem % N;
+                rem /= N;
+            }
+            digits
+        })
+        .collect();
+
+    // Step 2: build d matrices of shape T x N
+    let mut result = vec![vec![vec![F::zero(); N]; T]; d];
+
+    for (i, digits) in digits_per_addr.iter().enumerate() {
+        for (j, &digit) in digits.iter().enumerate() {
+            result[j][i][digit] = F::one();
+        }
     }
 
-    if !n.is_power_of_two() {
-        panic!("{k} is a perfect {d}th power but not a power of 2");
+    result
+}
+/// Implements the sumcheck prover for the generic core Shout PIOP for d=1.
+/// See Figure 7 of https://eprint.iacr.org/2025/105
+pub fn prove_generic_core_shout_pip_d_greater_than_one<
+    F: JoltField,
+    ProofTranscript: Transcript,
+>(
+    lookup_table: Vec<F>,
+    read_addresses: Vec<usize>,
+    d: u32,
+    transcript: &mut ProofTranscript,
+) -> (
+    SumcheckInstanceProof<F, ProofTranscript>,
+    Vec<F>,
+    F,
+    F,
+    F,
+    F,
+) {
+    // This assumes that K and T are powers of 2
+    let K = lookup_table.len();
+    let T = read_addresses.len();
+    let N = (K as f64).powf(1.0 / d as f64).round() as usize;
+    // A random field element F^{\log_2 T} for Schwartz-Zippll
+    // This is stored in Big Endian
+    let r_cycle: Vec<F> = transcript.challenge_vector(T.log_2());
+    // Page 50: eq(44)
+    let E_star: Vec<F> = EqPolynomial::evals(&r_cycle);
+    // Page 50: eq(47) : what the paper calls v_k
+    let C: Vec<_> = (0..K) // This is C[x] = ra(r_cycle, x)
+        .into_par_iter()
+        .map(|k| {
+            read_addresses
+                .iter()
+                .enumerate()
+                .filter_map(|(cycle, address)| {
+                    if *address == k {
+                        // this check will be more complex for d > 1 but let's keep
+                        // this for now
+                        Some(E_star[cycle])
+                    } else {
+                        None
+                    }
+                })
+                .sum::<F>()
+        })
+        .collect();
+
+    let num_rounds = K.log_2() + T.log_2();
+    // The vector storing the verifiers sum-check challenges
+    let mut r_address: Vec<F> = Vec::with_capacity(num_rounds);
+
+    // The sum check answer (for d=1, it's the same as normal one)
+    let sumcheck_claim: F = C
+        .par_iter()
+        .zip(lookup_table.par_iter())
+        .map(|(&ra, &val)| ra * val)
+        .sum();
+
+    let mut previous_claim = sumcheck_claim;
+
+    // These are the polynomials the prover commits to
+    let mut ra = MultilinearPolynomial::from(C);
+    let mut val = MultilinearPolynomial::from(lookup_table);
+
+    // Binding the first log_2 K variables
+    const DEGREE: usize = 2;
+    let mut compressed_polys: Vec<CompressedUniPoly<F>> = Vec::with_capacity(num_rounds);
+    for _ in 0..K.log_2() {
+        // Page 51: (eq 51)
+        let univariate_poly_evals: [F; DEGREE] = (0..ra.len() / 2)
+            .into_par_iter()
+            .map(|index| {
+                let ra_evals = ra.sumcheck_evals(index, DEGREE, BindingOrder::LowToHigh);
+                let val_evals = val.sumcheck_evals(index, DEGREE, BindingOrder::LowToHigh);
+                [ra_evals[0] * val_evals[0], ra_evals[1] * val_evals[1]] // since DEGREE=2
+            })
+            .reduce(
+                || [F::zero(); DEGREE],
+                |running, new| [running[0] + new[0], running[1] + new[1]],
+            );
+
+        // Construct coefficients of univariate polynomial from evaluations
+        // No Gruen optimisation here
+        let univariate_poly = UniPoly::from_evals(&[
+            univariate_poly_evals[0],
+            previous_claim - univariate_poly_evals[0],
+            univariate_poly_evals[1],
+        ]);
+        let compressed_poly = univariate_poly.compress();
+        compressed_poly.append_to_transcript(transcript);
+        compressed_polys.push(compressed_poly);
+
+        // Get challenge that binds the variable
+        let r_j = transcript.challenge_scalar::<F>();
+        r_address.push(r_j);
+
+        previous_claim = univariate_poly.evaluate(&r_j);
+
+        rayon::join(
+            || ra.bind_parallel(r_j, BindingOrder::LowToHigh),
+            || val.bind_parallel(r_j, BindingOrder::LowToHigh),
+        );
     }
-    n
+
+    // tau = r_address (the verifiers challenges which bind all log K variables of memory)
+    // This is \widetilde{Val}(\tau) from the paper (eq 52)
+    let val_claim = val.final_sumcheck_claim();
+
+    // At this point we should have bound the first log K variables
+
+    // Making E_star into a ML poly
+    let mut eq_r_cycle = MultilinearPolynomial::from(E_star);
+
+    // As d > 1, we will have df length T
+    let eq_taus: Vec<Vec<F>> = compute_eq_taus_parallel(&r_address, d as usize, N.log_2());
+    // This is the same E as the one referenced on Page 51 of Shetty/Thaler
+    let mut E: Vec<Vec<F>> = vec![vec![F::zero(); T]; d as usize];
+    // Filling out E involve any multiplications
+    // Just lookups
+    // iterate of each table e_j in parallel
+    E.par_iter_mut().enumerate().for_each(|(j, e_j)| {
+        // for a fixed table e_j iterate through all of time stamps
+        e_j.par_iter_mut().enumerate().for_each(|(y, e)| {
+            // take the memory cell to be read at time y and extrac j'th digit: addr_j
+            // (which is also the index in array e_j[y: addr_j])
+            // Here when j=0 we get the MSB and when j=d-1 we get the LSB
+            let addr_j = digit_j_of(read_addresses[y], j, d as usize, N);
+            // Since eq_taus[0] contains the first log N bits of of read_address
+            // we adjust the indexing
+            *e = eq_taus[d as usize - j - 1][addr_j];
+        });
+    });
+
+    // The E tables will be dropped once we make ra_taus
+    let mut ra_taus: Vec<MultilinearPolynomial<F>> =
+        E.into_par_iter().map(MultilinearPolynomial::from).collect();
+
+    let degree: usize = d as usize + 1;
+    for _ in 0..T.log_2() {
+        let univariate_poly_evals: Vec<F> = (0..ra_taus[0].len() / 2)
+            .into_par_iter()
+            .map(|index| {
+                // For each of the d ra_taus we should get d sumcheck evals as the evaluation at 1
+                // is constructed from the previous claim
+                let ra_evals_per_tau: Vec<Vec<F>> = ra_taus
+                    .iter()
+                    .map(|ra_tau| ra_tau.sumcheck_evals(index, degree, BindingOrder::LowToHigh))
+                    .collect();
+
+                // val_evals stays the same (Vec<F> of length degree)
+                let eq_r_cycle_evals =
+                    eq_r_cycle.sumcheck_evals(index, degree, BindingOrder::LowToHigh);
+                // Multiply all ra_evals vectors elementwise, then multiply by val_evals
+                let mut result = vec![F::one(); degree];
+
+                for i in 0..degree {
+                    for ra_evals in &ra_evals_per_tau {
+                        result[i] *= ra_evals[i];
+                    }
+                    result[i] *= eq_r_cycle_evals[i];
+                }
+
+                result
+            })
+            .reduce(
+                || vec![F::zero(); degree],
+                |running, new| {
+                    running
+                        .iter()
+                        .zip(new.iter())
+                        .map(|(a, b)| *a + *b)
+                        .collect()
+                },
+            );
+
+        let d_plus_one_evaluations =
+            construct_final_sumcheck_evals(&univariate_poly_evals, val_claim, previous_claim);
+        let univariate_poly = UniPoly::from_evals(&d_plus_one_evaluations);
+
+        // Skip the linear term when storing coeffs as we can always re-construct it
+        let compressed_poly = univariate_poly.compress();
+        compressed_poly.append_to_transcript(transcript);
+        compressed_polys.push(compressed_poly);
+
+        // Get challenge that binds the variable
+        let r_j = transcript.challenge_scalar::<F>();
+        r_address.push(r_j);
+
+        previous_claim = univariate_poly.evaluate(&r_j);
+
+        rayon::join(
+            || {
+                ra_taus.par_iter_mut().for_each(|ra_tau| {
+                    ra_tau.bind_parallel(r_j, BindingOrder::LowToHigh);
+                });
+            },
+            || eq_r_cycle.bind_parallel(r_j, BindingOrder::LowToHigh),
+        );
+    }
+
+    // This is wrong : we need to multiply by Vals(Tau)
+    //let ra_tau_claim = ra_tau.final_sumcheck_claim();
+    let eq_r_cycle_at_r_time = eq_r_cycle.final_sumcheck_claim();
+    (
+        SumcheckInstanceProof::new(compressed_polys),
+        r_address,
+        sumcheck_claim,
+        F::one(),
+        val_claim,
+        eq_r_cycle_at_r_time,
+    )
+}
+
+/// Constructs the evaluations of the final univariate polynomial for sumcheck in parallel.
+///
+/// - For `i == 1`: `A[1] = previous_claim - val_claim * univariate_poly_evals[0]`
+/// - For other `i`: `A[i] = val_claim * univariate_poly_evals[i]`
+///
+/// # Arguments
+/// - `univariate_poly_evals`: Vector of evaluations of the product polynomial (length `d+1`)
+/// - `val_claim`: Final claim from previous round
+/// - `previous_claim`: Claimed value for this round
+///
+/// # Returns
+/// A vector `A` of length `d+1` representing the evaluations of the final univariate polynomial
+pub fn construct_final_sumcheck_evals<F: JoltField>(
+    univariate_poly_evals: &[F],
+    val_claim: F,
+    previous_claim: F,
+) -> Vec<F> {
+    let first_term = val_claim * univariate_poly_evals[0];
+
+    (0..univariate_poly_evals.len())
+        .into_par_iter()
+        .map(|i| {
+            if i == 1 {
+                previous_claim - first_term
+            } else {
+                val_claim * univariate_poly_evals[i]
+            }
+        })
+        .collect()
+}
+
+/// Let tau = r_address, the first log K challenges of the verifier.
+/// Computes `d` decomposed evaluation tables of the multilinear equality polynomial `eq(tau, x)`
+/// in parallel, given a flattened bitstring `tau ∈ F^{d * log_n}`.
+///
+/// Each `eq_tau[j]` corresponds to the evaluation of the multilinear equality
+/// polynomial over chunk of [j*\log_2 N...(j+1)*\log_2 N]`tau`.
+///
+/// More precisely:
+/// - For each `j ∈ {0, ..., d-1}`, the chunk `r_address[j * log_n .. (j + 1) * log_n]`
+///   is reversed and passed into `EqPolynomial::evals()`
+///   The reversal happens because EqPolynomial::evals accepts inputs in Big Endian,
+///   But r_address is stored in little endian form.
+/// - The result is a vector of `d` vectors, where each inner vector contains
+///   `2^log_2 N` field elements corresponding to `eq(tau_j, x)` for all `x ∈ {0,1}^log_N`
+///
+/// # Arguments
+///
+/// * `r_address` - A slice of field elements of length `d * log_n`,
+/// * `d` - The number of address chunks / dimensions (should divide `r_address.len()`).
+/// * `log_n` - The number of bits per address chunk (i.e., chunk size).
+///
+/// # Returns
+///
+/// A `Vec<Vec<F>>` of length `d`. Each inner vector contains `2^log_n` evaluations
+/// of `eq(tau_j, x)` over `x ∈ {0,1}^log_n`, for the j-th address chunk.
+///
+/// # Panics
+///
+/// Panics if `r_address.len() != d * log_n`.
+///
+/// # Parallelism
+///
+/// The outer loop over `j` is parallelized using `rayon`. Each equality polynomial
+/// evaluation is performed independently on a separate chunk of `r_address`.
+///
+/// # Example
+/// ```rust
+/// let d = 2;
+/// let log_n = 3; // so each chunk is 3 bits = 8 entries
+/// let r_address = vec![F::zero(); d * log_n];
+///
+/// let eq_taus = compute_eq_taus_parallel(&r_address, d, log_n);
+/// assert_eq!(eq_taus.len(), d);
+/// assert_eq!(eq_taus[0].len(), 1 << log_n); // 8
+/// ```
+///
+/// # Note
+///
+/// All inputs and evaluations use big-endian ordering for consistency with
+/// the rest of the Jolt protocol.
+///
+/// # See Also
+///
+/// [`EqPolynomial::evals`] — the underlying function used to evaluate `eq(tau, x)`.
+fn compute_eq_taus_parallel<F: JoltField>(
+    r_address: &[F], // length must be d * log_N = \log K
+    d: usize,
+    log_n: usize,
+) -> Vec<Vec<F>> {
+    assert_eq!(r_address.len(), d * log_n);
+
+    (0..d)
+        .into_par_iter()
+        .map(|j| {
+            let start = j * log_n;
+            let end = start + log_n;
+
+            let mut tau_bits = r_address[start..end].to_vec();
+            tau_bits.reverse(); // BigEndian
+
+            EqPolynomial::evals(&tau_bits)
+        })
+        .collect()
+}
+
+/// Extracts the `j`-th digit (0-indexed from the most significant digit) of `addr`
+/// when written in base `base`, assuming the total number of digits is `d`.
+///
+/// # Arguments
+///
+/// - `addr`: The integer address to decompose.
+/// - `j`: The digit index (0 = most significant, `d - 1` = least significant).
+/// - `d`: The total number of digits in the base-`base` representation.
+/// - `base`: The numerical base (e.g., `K^{1/d}`).
+///
+/// # Returns
+///
+/// The `j`-th digit of `addr` in base `base`.
+///
+/// # Panics
+///
+/// Panics if `base.pow(d as u32)` overflows or if `j >= d`.
+///
+/// # Examples
+///
+/// ```rust
+/// let addr = 10;
+/// let base = 4;
+/// let d = 2; // because 10 in base 4 is "2 2"
+///
+/// assert_eq!(digit_j(addr, 0, d, base), 2); // most significant digit
+/// assert_eq!(digit_j(addr, 1, d, base), 2); // least significant digit
+/// ```
+fn digit_j_of(addr: usize, j: usize, d: usize, base: usize) -> usize {
+    // Convert from most-significant-first index (0 = most significant)
+    let exp = d - 1 - j;
+    (addr / base.pow(exp as u32)) % base
 }
 
 /// Implements the sumcheck prover for the generic core Shout PIOP for d=1.
@@ -1448,6 +1824,43 @@ mod tests {
     use ark_std::test_rng;
     use rand_core::RngCore;
 
+    #[test]
+    fn test_decompose_one_hot_matrix() {
+        let read_addresses = vec![5, 10];
+        let table_size = 16;
+        let d = 2; // So N = 4 since 4^2 = 16
+
+        let result = decompose_one_hot_matrix::<Fr>(&read_addresses, table_size, d);
+
+        // Expecting 2 matrices (since d = 2)
+        assert_eq!(result.len(), 2);
+        // Each matrix should have T = 2 rows
+        assert_eq!(result[0].len(), 2);
+        // Each row should have N = 4 entries
+        assert_eq!(result[0][0].len(), 4);
+
+        // Base-4 decomposition:
+        // 5  -> [1, 1]
+        // 10 -> [2, 2]
+
+        assert_eq!(
+            result[0][0],
+            vec![Fr::zero(), Fr::one(), Fr::zero(), Fr::zero()]
+        );
+        assert_eq!(
+            result[0][1],
+            vec![Fr::zero(), Fr::zero(), Fr::one(), Fr::zero()]
+        );
+
+        assert_eq!(
+            result[1][0],
+            vec![Fr::zero(), Fr::one(), Fr::zero(), Fr::zero()]
+        );
+        assert_eq!(
+            result[1][1],
+            vec![Fr::zero(), Fr::zero(), Fr::one(), Fr::zero()]
+        );
+    }
     #[test]
     fn shout_e2e() {
         const TABLE_SIZE: usize = 64;
