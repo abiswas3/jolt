@@ -725,7 +725,14 @@ impl<F: JoltField, ProofTranscript: Transcript> SumcheckInstanceProof<F, ProofTr
         assert_eq!(self.compressed_polys.len(), num_rounds);
         for i in 0..self.compressed_polys.len() {
             // verify degree bound
-            if self.compressed_polys[i].degree() != degree_bound {
+            // This used to be not equal to but in the sum-check in Section 6.2 of Shout
+            // (Shetty/Thaler) the first log K rounds have a degree 2 univariate polynomial
+            // but the last log T rounds will have a degree bound of d + 1
+            // So there is no way to make the
+            // if self.compressed_polys[i].degree() != degree_bound pass
+            // Instead we change it to > degree_bound, which is what the textbook sum-check
+            // description asks us to do.
+            if self.compressed_polys[i].degree() > degree_bound {
                 return Err(ProofVerifyError::InvalidInputLength(
                     degree_bound,
                     self.compressed_polys[i].degree(),
