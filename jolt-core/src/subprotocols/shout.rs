@@ -292,44 +292,6 @@ impl<F: JoltField, ProofTranscript: Transcript> ShoutProof<F, ProofTranscript> {
     }
 }
 
-fn decompose_one_hot_matrix<F: JoltField>(
-    read_addresses: &[usize],
-    table_size: usize,
-    d: usize,
-) -> Vec<Vec<Vec<F>>> {
-    let T = read_addresses.len();
-    let N = (table_size as f64).powf(1.0 / d as f64).round() as usize;
-    assert_eq!(
-        N.pow(d as u32),
-        table_size,
-        "K must be a perfect power of N"
-    );
-
-    // Step 1: compute base-N digits for each address
-    let digits_per_addr: Vec<Vec<usize>> = read_addresses
-        .par_iter()
-        .map(|&addr| {
-            let mut digits = vec![0; d];
-            let mut rem = addr;
-            for j in (0..d).rev() {
-                digits[j] = rem % N;
-                rem /= N;
-            }
-            digits
-        })
-        .collect();
-
-    // Step 2: build d matrices of shape T x N
-    let mut result = vec![vec![vec![F::zero(); N]; T]; d];
-
-    for (i, digits) in digits_per_addr.iter().enumerate() {
-        for (j, &digit) in digits.iter().enumerate() {
-            result[d - j - 1][i][digit] = F::one();
-        }
-    }
-
-    result
-}
 /// Implements the sumcheck prover for the generic core Shout PIOP for d=1.
 /// See Figure 7 of https://eprint.iacr.org/2025/105
 pub fn prove_generic_core_shout_pip_d_greater_than_one<
@@ -395,24 +357,24 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one<
     let mut val = MultilinearPolynomial::from(lookup_table);
 
     // Binding the first log_2 K variables
-    const DEGREE: usize = 2;
+    const DEGREE_ADDR: usize = 2;
     let mut compressed_polys: Vec<CompressedUniPoly<F>> = Vec::with_capacity(num_rounds);
     for _ in 0..K.log_2() {
         // Page 51: (eq 51)
-        let univariate_poly_evals: [F; DEGREE] = (0..ra.len() / 2)
+        let univariate_poly_evals: [F; DEGREE_ADDR] = (0..ra.len() / 2)
             .into_par_iter()
             .map(|index| {
-                let ra_evals = ra.sumcheck_evals(index, DEGREE, BindingOrder::LowToHigh);
-                let val_evals = val.sumcheck_evals(index, DEGREE, BindingOrder::LowToHigh);
-                [ra_evals[0] * val_evals[0], ra_evals[1] * val_evals[1]] // since DEGREE=2
+                let ra_evals = ra.sumcheck_evals(index, DEGREE_ADDR, BindingOrder::LowToHigh);
+                let val_evals = val.sumcheck_evals(index, DEGREE_ADDR, BindingOrder::LowToHigh);
+                [ra_evals[0] * val_evals[0], ra_evals[1] * val_evals[1]] // since DEGREE_ADDR=2
             })
             .reduce(
-                || [F::zero(); DEGREE],
+                || [F::zero(); DEGREE_ADDR],
                 |running, new| [running[0] + new[0], running[1] + new[1]],
             );
 
         // Construct coefficients of univariate polynomial from evaluations
-        // No Gruen optimisation here
+        // No Gruen optimisation here for now
         let univariate_poly = UniPoly::from_evals(&[
             univariate_poly_evals[0],
             previous_claim - univariate_poly_evals[0],
@@ -424,9 +386,16 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one<
 
         // Get challenge that binds the variable
         let r_j = transcript.challenge_scalar::<F>();
+        //let r_j = match debug_count {
+        //    0 => F::from_u8(2),
+        //    1 => F::from_u8(3),
+        //    2 => F::from_u8(4),
+        //    _ => F::one(), // fallback case if needed
+        //};
         r_address.push(r_j);
-
         previous_claim = univariate_poly.evaluate(&r_j);
+        //println!("r_address[{debug_count}] = {r_j}");
+        //println!("g_{debug_count}[{r_j}]={previous_claim}");
 
         rayon::join(
             || ra.bind_parallel(r_j, BindingOrder::LowToHigh),
@@ -463,36 +432,42 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one<
             *e = eq_taus[d - j - 1][addr_j];
         });
     });
+    // FIX later -- this because extact last digits first so E[j] updates is being mapped to eq_taus[d-j-1]
     E.reverse();
     // The E tables will be dropped once we make ra_taus
     let mut ra_taus: Vec<MultilinearPolynomial<F>> =
         E.into_par_iter().map(MultilinearPolynomial::from).collect();
 
-    let DEGREE_TME: usize = d + 1;
+    let DEGREE_TME: usize = d + 2;
     for _ in 0..T.log_2() {
         let univariate_poly_evals: Vec<F> = (0..ra_taus[0].len() / 2)
             .into_par_iter()
             .map(|index| {
+                let eq_r_cycle_evals =
+                    eq_r_cycle.sumcheck_evals(index, DEGREE_TME, BindingOrder::LowToHigh);
                 // For each of the d ra_taus we should get d sumcheck evals as the evaluation at 1
                 // is constructed from the previous claim
+                // This happens only d times so there's no need to parallelise
                 let ra_evals_per_tau: Vec<Vec<F>> = ra_taus
                     .iter()
                     .map(|ra_tau| ra_tau.sumcheck_evals(index, DEGREE_TME, BindingOrder::LowToHigh))
                     .collect();
 
-                // val_evals stays the same (Vec<F> of length degree)
-                let eq_r_cycle_evals =
-                    eq_r_cycle.sumcheck_evals(index, DEGREE_TME, BindingOrder::LowToHigh);
-                // Multiply all ra_evals vectors elementwise, then multiply by val_evals
-                let mut result = vec![F::one(); DEGREE_TME];
+                // The parallelisation should be over ra_evals_per_tau which can be as
+                // large as ra_taus[0].len()/2 = T/2 initially.
+                // It shrinks by half at each round
+                // TODO: once the size of ra_taus[0] is small enough
+                // we should swtich from par_iter to iter.
+                let result: Vec<F> = (0..DEGREE_TME)
+                    .map(|i| {
+                        let col_product = ra_evals_per_tau
+                            .par_iter()
+                            .map(|row| row[i])
+                            .reduce(|| F::one(), |a, b| a * b);
 
-                for i in 0..(DEGREE_TME) {
-                    for ra_evals in &ra_evals_per_tau {
-                        result[i] *= ra_evals[i];
-                    }
-                    result[i] *= eq_r_cycle_evals[i];
-                }
-
+                        col_product * eq_r_cycle_evals[i]
+                    })
+                    .collect();
                 result
             })
             .reduce(
@@ -506,8 +481,12 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one<
                 },
             );
 
-        let d_plus_one_evaluations =
-            construct_final_sumcheck_evals(&univariate_poly_evals, val_claim, previous_claim);
+        let d_plus_one_evaluations = construct_final_sumcheck_evals(
+            &univariate_poly_evals,
+            val_claim,
+            previous_claim,
+            DEGREE_TME,
+        );
         let univariate_poly = UniPoly::from_evals(&d_plus_one_evaluations);
 
         // Skip the linear term when storing coeffs as we can always re-construct it
@@ -517,9 +496,14 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one<
 
         // Get challenge that binds the variable
         let r_j = transcript.challenge_scalar::<F>();
-        r_address.push(r_j);
+        //let r_j = match debug_count {
+        //    0 => F::from_u8(2),
+        //    1 => F::from_u8(3),
+        //    2 => F::from_u8(4),
+        //    _ => F::one(), // fallback case if needed
+        //};
 
-        previous_claim = univariate_poly.evaluate(&r_j);
+        r_address.push(r_j);
 
         rayon::join(
             || {
@@ -531,18 +515,13 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one<
         );
     }
 
-    // This is wrong : we need to multiply by Vals(Tau)
-    //let ra_tau_claim = ra_tau.final_sumcheck_claim();
-    for (j, ra) in ra_taus.iter().enumerate() {
-        println!("Inside ra_{} =: {}", j, ra.final_sumcheck_claim());
-    }
     let ras_raddress_rtime_product: F = ra_taus
         .par_iter()
         .map(|ra| ra.final_sumcheck_claim())
         .reduce(|| F::one(), |acc, val| acc * val);
+
     let eq_r_cycle_at_r_time = eq_r_cycle.final_sumcheck_claim();
-    println!("Inside eq_r_cycle_at_r_time_claim: {eq_r_cycle_at_r_time}");
-    println!("Inside val: {val_claim}");
+
     (
         SumcheckInstanceProof::new(compressed_polys),
         r_address,
@@ -555,33 +534,39 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one<
 
 /// Constructs the evaluations of the final univariate polynomial for sumcheck in parallel.
 ///
-/// - For `i == 1`: `A[1] = previous_claim - val_claim * univariate_poly_evals[0]`
-/// - For other `i`: `A[i] = val_claim * univariate_poly_evals[i]`
+/// - For `i == 1`: `result[1] = previous_claim - val_claim * univariate_poly_evals[0]`
+/// - For other `i`: `result[i] = val_claim * univariate_poly_evals[i]`
 ///
 /// # Arguments
-/// - `univariate_poly_evals`: Vector of evaluations of the product polynomial (length `d+1`)
-/// - `val_claim`: Final claim from previous round
-/// - `previous_claim`: Claimed value for this round
+/// - `univariate_poly_evals`: Vector of evaluations of the product polynomial (length `degree`)
+/// - `val_claim`: val(r_address) which needs to be nmultiplied to each of the evals
+/// - `previous_claim`: Claimed value for this round which is meant to equal result[0] + result[1]
 ///
 /// # Returns
-/// A vector `A` of length `d+1` representing the evaluations of the final univariate polynomial
+/// A vector `result` of length `degree+1` representing the evaluations of the final univariate polynomial
 pub fn construct_final_sumcheck_evals<F: JoltField>(
     univariate_poly_evals: &[F],
     val_claim: F,
     previous_claim: F,
+    degree: usize,
 ) -> Vec<F> {
-    let first_term = val_claim * univariate_poly_evals[0];
+    let first_term = val_claim
+        * univariate_poly_evals
+            .first()
+            .expect("univariate_poly_evals must be non-empty");
 
-    (0..univariate_poly_evals.len())
+    let result: Vec<_> = (0..=degree)
         .into_par_iter()
-        .map(|i| {
-            if i == 1 {
-                previous_claim - first_term
-            } else {
-                val_claim * univariate_poly_evals[i]
+        .map(|i| match i {
+            1 => previous_claim - first_term,
+            _ => {
+                let eval_idx = if i > 1 { i - 1 } else { i };
+                val_claim * univariate_poly_evals[eval_idx]
             }
         })
-        .collect()
+        .collect();
+
+    result
 }
 
 /// Let tau = r_address, the first log K challenges of the verifier.
@@ -805,7 +790,7 @@ pub fn prove_generic_core_shout_pip<F: JoltField, ProofTranscript: Transcript>(
     let mut r_address_reversed = r_address.clone();
     r_address_reversed.reverse();
     let eq_tau: Vec<F> = EqPolynomial::evals(&r_address_reversed); // This log K and r_cycle was \log T isn't it?
-    let mut E = vec![F::zero(); T]; // When d > 1 there will be d of these arrays
+    let mut E = vec![F::zero(); T];
     E.par_iter_mut().enumerate().for_each(|(y, e)| {
         *e = eq_tau[read_addresses[y]];
     });
@@ -1827,6 +1812,7 @@ pub fn prove_raf_evaluation<F: JoltField, ProofTranscript: Transcript>(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::utils::transcript::KeccakTranscript;
     use ark_bn254::Fr;
@@ -1836,44 +1822,177 @@ mod tests {
 
     #[test]
     fn test_decompose_one_hot_matrix() {
-        let read_addresses = vec![5, 11];
-        let table_size = 16;
-        let d = 2; // So N = 4 since 4^2 = 16
-
-        let result = decompose_one_hot_matrix::<Fr>(&read_addresses, table_size, d);
+        let lookup_table = [
+            Fr::from_u8(3),
+            Fr::from_u8(2),
+            Fr::from_u8(1),
+            Fr::from_u8(0),
+        ]
+        .to_vec();
+        let read_addresses = vec![2, 3];
+        let table_size = 4;
+        let d = 2; // So N = 2 since 2^2 = 4
+        let N = 2;
+        let ras = decompose_one_hot_matrix::<Fr>(&read_addresses, table_size, d);
 
         // Expecting 2 matrices (since d = 2)
-        assert_eq!(result.len(), 2);
+        assert_eq!(ras.len(), 2);
         // Each matrix should have T = 2 rows
-        assert_eq!(result[0].len(), 2);
-        // Each row should have N = 4 entries
-        assert_eq!(result[0][0].len(), 4);
+        assert_eq!(ras[0].len(), 2);
+        assert_eq!(ras[1].len(), 2);
+
+        // Each row should have N = 2 entries
+        assert_eq!(ras[0][0].len(), 2);
+        assert_eq!(ras[1][0].len(), 2);
 
         // Base-4 decomposition:
-        // 5  -> [1, 1]
-        // 11 ->  [2, 3]
+        // 2  -> MSB [1, 0] LSB
+        // 3 ->  MSB [1, 1] LSB
 
-        // Least signficant digit
-        // 1 and 3
-        assert_eq!(
-            result[0][0],
-            vec![Fr::zero(), Fr::one(), Fr::zero(), Fr::zero()]
-        );
-        assert_eq!(
-            result[0][1],
-            vec![Fr::zero(), Fr::zero(), Fr::zero(), Fr::one()]
+        // FIRST MATRIX FIRST ROW and Second Row
+        // ra_0[0: ..]
+        // ra_0[1: ..]
+        assert_eq!(ras[0][0], vec![Fr::one(), Fr::zero()]);
+        assert_eq!(ras[0][1], vec![Fr::zero(), Fr::one()]);
+
+        // Second Matrix
+        // ra_1[0: ..]
+        // ra_1[1: ..]
+        assert_eq!(ras[1][0], vec![Fr::zero(), Fr::one()]);
+        assert_eq!(ras[1][1], vec![Fr::zero(), Fr::one()]);
+
+        //===================d=1==========================================================================
+        let ra: Vec<Vec<Fr>> = read_addresses
+            .par_iter()
+            .map(|&addr| {
+                (0..table_size)
+                    .into_par_iter()
+                    .map(|j| if j == addr { Fr::one() } else { Fr::zero() })
+                    .collect()
+            })
+            .collect();
+        let flattened: Vec<Fr> = ra.iter().flat_map(|row| row.iter().cloned()).collect();
+        let ra_poly = MultilinearPolynomial::from(flattened);
+        //---------------------------------------------------------------------------------------------
+
+        //==============================d > 1====================================
+        let flattened_ras: Vec<Vec<Fr>> = (0..d)
+            .into_par_iter()
+            .map(|d| {
+                ras[d]
+                    .iter()
+                    .flat_map(|row| row.iter().cloned())
+                    .collect::<Vec<Fr>>()
+            })
+            .collect();
+
+        let ra_polys: Vec<MultilinearPolynomial<Fr>> = flattened_ras
+            .into_par_iter()
+            .map(MultilinearPolynomial::from)
+            .collect();
+        //-------------------------------------------------
+
+        // CHALLENGES
+        let mut r_address: Vec<Fr> = [Fr::from_u8(2), Fr::from_u8(3)].to_vec();
+        let r_cycle: Vec<Fr> = [Fr::from_u8(10)].to_vec();
+        let mut r_time: Vec<Fr> = [Fr::from_u8(4)].to_vec();
+        for (i, &time) in r_time.iter().enumerate() {
+            println!("r_time[{i}] = {time}");
+        }
+        for (i, address) in r_address.iter().enumerate() {
+            println!("r_adddress[{i}] = {address}");
+        }
+
+        // Common Polynomials
+        let eq_rcycle = MultilinearPolynomial::from(EqPolynomial::evals(&r_cycle));
+        let val = MultilinearPolynomial::from(lookup_table.clone());
+
+        // FULL LOCATION FOR BIG ra
+        let mut full_random_location = r_address.clone();
+        full_random_location.extend(r_time.clone());
+        full_random_location.reverse();
+        let ra_evaluated_r_address_r_time = ra_poly.evaluate(&full_random_location);
+
+        // CHUNKED FULL LOCATIONS FOR ras
+        let chunk_size = N.log_2();
+        let r_address_chunked: Vec<Vec<Fr>> = (0..d)
+            .map(|i| {
+                let start = i * chunk_size;
+                let end = (i + 1) * chunk_size;
+                r_address[start..end].to_vec()
+            })
+            .collect();
+        // this is r_address_chunkded || r_time
+        let full_chunked_locations: Vec<Vec<Fr>> = (0..d)
+            .map(|i| {
+                let mut combined = r_address_chunked[i].clone(); // clone the chunk
+                combined.extend_from_slice(&r_time); // append r_time
+                combined
+            })
+            .collect();
+
+        // Evaluate each ra[j] j=0..d for chunked location
+        let evaluations: Vec<Fr> = (0..d)
+            .map(|i| {
+                let mut random_location_rev = full_chunked_locations[i].clone();
+                random_location_rev.reverse();
+                ra_polys[i].evaluate(&random_location_rev) // no semicolon, return this value
+            })
+            .collect();
+
+        r_time.reverse();
+        let eq_r_cycle_r_time = eq_rcycle.evaluate(&r_time);
+        assert_eq!(eq_r_cycle_r_time, Fr::from_u16(67));
+
+        r_address.reverse();
+        let _val_raddress = val.evaluate(&r_address);
+
+        let mut acc_val = Fr::one();
+        for (j, val) in evaluations.iter().enumerate() {
+            for &loc in full_chunked_locations[j].iter() {
+                print!("{loc}, ");
+            }
+            println!();
+            acc_val *= val;
+            println!("Direct: ra_{j}[above]= {val}");
+        }
+        println!(
+            "Final accumulated value: {acc_val}\nOne-shot value: {ra_evaluated_r_address_r_time}"
         );
 
-        // most significant digit
-        // 1 and 1
-        assert_eq!(
-            result[1][0],
-            vec![Fr::zero(), Fr::one(), Fr::zero(), Fr::zero()]
-        );
-        assert_eq!(
-            result[1][1],
-            vec![Fr::zero(), Fr::zero(), Fr::one(), Fr::zero()]
-        );
+        // Mathematically the big vector == chunked vector
+        // so this should really be the same
+        assert_eq!(acc_val, ra_evaluated_r_address_r_time);
+        assert_eq!(acc_val, Fr::from_u16(33));
+
+        let mut sumcheck_claim = Fr::zero();
+        for i in 0..8 {
+            // Construct x as [MSB, mid, LSB] (big-endian)
+            let x = [
+                if (i >> 2) & 1 == 1 {
+                    Fr::one()
+                } else {
+                    Fr::zero()
+                }, // MSB = x[0]
+                if (i >> 1) & 1 == 1 {
+                    Fr::one()
+                } else {
+                    Fr::zero()
+                }, // mid = x[1]
+                if i & 1 == 1 { Fr::one() } else { Fr::zero() }, // LSB = x[2]
+            ];
+
+            // x[1..] = LSB and mid (for val)
+            // x[..1] = MSB only (for eq_rcycle)
+            let x_tail = &x[1..]; // x[1], x[2] — 2 LSBs
+            let x_head = &x[..1]; // x[0] — MSB only
+
+            let term = ra_poly.evaluate(&x) * val.evaluate(x_tail) * eq_rcycle.evaluate(x_head);
+
+            sumcheck_claim += term;
+        }
+        assert_eq!(sumcheck_claim, eq_rcycle.evaluate(&[Fr::zero()]));
+        println!("SUMCHECK VALUE= {sumcheck_claim}");
     }
     #[test]
     fn shout_e2e() {
@@ -1979,22 +2098,71 @@ mod tests {
             final_claim
         );
     }
+    fn decompose_one_hot_matrix<F: JoltField>(
+        read_addresses: &[usize],
+        table_size: usize,
+        d: usize,
+    ) -> Vec<Vec<Vec<F>>> {
+        let T = read_addresses.len();
+        let N = (table_size as f64).powf(1.0 / d as f64).round() as usize;
+        assert_eq!(
+            N.pow(d as u32),
+            table_size,
+            "K must be a perfect power of N"
+        );
+
+        // Step 1: compute base-N digits for each address
+        let digits_per_addr: Vec<Vec<usize>> = read_addresses
+            .par_iter()
+            .map(|&addr| {
+                let mut digits = vec![0; d];
+                let mut rem = addr;
+                for j in (0..d).rev() {
+                    digits[j] = rem % N;
+                    rem /= N;
+                }
+                digits
+            })
+            .collect();
+
+        // Step 2: build d matrices of shape T x N
+        let mut result = vec![vec![vec![F::zero(); N]; T]; d];
+
+        for (i, digits) in digits_per_addr.iter().enumerate() {
+            for (j, &digit) in digits.iter().enumerate() {
+                result[d - j - 1][i][digit] = F::one();
+            }
+        }
+
+        result
+    }
 
     #[test]
     fn test_core_generic_d_greater_than_one_shout_sumcheck() {
-        const TABLE_SIZE: usize = 16;
-        const D: usize = 2;
-        const N: usize = 4;
-        const NUM_LOOKUPS: usize = 1 << 10; // 2**10
-        let mut rng = test_rng();
+        //const TABLE_SIZE: usize = 4;
+        //const D: usize = 2;
+        //const N: usize = 2;
+        //const NUM_LOOKUPS: usize = 1 << 2; // 2**10
+        //let mut rng = test_rng();
+        //
+        //let lookup_table: Vec<Fr> = (0..TABLE_SIZE).map(|_| Fr::random(&mut rng)).collect();
+        //let read_addresses: Vec<usize> = (0..NUM_LOOKUPS)
+        //    .map(|_| rng.next_u32() as usize % TABLE_SIZE)
+        //    .collect();
+        //
+        let lookup_table = [
+            Fr::from_u8(3),
+            Fr::from_u8(2),
+            Fr::from_u8(1),
+            Fr::from_u8(2),
+        ]
+        .to_vec();
+        let read_addresses = vec![2, 3];
+        let D = 2; // So N = 2 since 2^2 = 4
+        let N = 2;
 
-        let lookup_table: Vec<Fr> = (0..TABLE_SIZE).map(|_| Fr::random(&mut rng)).collect();
-        let read_addresses: Vec<usize> = (0..NUM_LOOKUPS)
-            .map(|_| rng.next_u32() as usize % TABLE_SIZE)
-            .collect();
         let table_size = lookup_table.len();
         let num_lookups = read_addresses.len();
-
         let ras: Vec<Vec<Vec<Fr>>> = decompose_one_hot_matrix(&read_addresses, table_size, D);
         let flattened_ras: Vec<Vec<Fr>> = (0..D)
             .into_par_iter()
@@ -2015,7 +2183,7 @@ mod tests {
         let mut prover_transcript = KeccakTranscript::new(b"test_transcript");
         let (
             sumcheck_proof,
-            _,
+            verifier_challenges,
             sumcheck_claim,
             ra_address_time_claim,
             val_tau_claim,
@@ -2027,17 +2195,24 @@ mod tests {
             &mut prover_transcript,
         );
 
+        println!("SUMCHECK CLAIM: {sumcheck_claim}");
+        let product = ra_address_time_claim * val_tau_claim * eq_rcycle_rtime_claim;
+        println!(
+    "ra_address_time_claim = {ra_address_time_claim}, \nval_tau_claim = {val_tau_claim}, \neq_rcycle_rtime_claim = {eq_rcycle_rtime_claim}, \nproduct = {product}",
+);
+
         let mut verifier_transcript = KeccakTranscript::new(b"test_transcript");
         verifier_transcript.compare_to(prover_transcript);
 
-        let _r_cycle: Vec<Fr> = verifier_transcript.challenge_vector(num_lookups.log_2());
+        // Already in Big ENDIAN
+        let r_cycle: Vec<Fr> = verifier_transcript.challenge_vector(num_lookups.log_2());
         let verification_result = sumcheck_proof.verify(
             sumcheck_claim,
             table_size.log_2() + num_lookups.log_2(),
-            D + 1,
+            D + 2,
             &mut verifier_transcript,
         );
-        let (final_claim, verifier_challenges) = verification_result.unwrap();
+        let (final_claim, _vfr_challenges) = verification_result.unwrap();
         //-------------------------------------------------------------------------
 
         let (r_address, r_time) = verifier_challenges.split_at(table_size.log_2());
@@ -2054,6 +2229,7 @@ mod tests {
                 r_address[start..end].to_vec()
             })
             .collect();
+
         // this is r_address_chunkded || r_time
         let full_random_locations: Vec<Vec<Fr>> = (0..D)
             .map(|i| {
@@ -2071,16 +2247,21 @@ mod tests {
             })
             .collect();
 
-        for (j, val) in evaluations.iter().enumerate() {
-            println!("Direct: ra_{j}[r_address_j || r_time ]= {val}");
-        }
         println!("Direct Val@r_address {val_at_r_address}");
         println!("Direct Eq@r_cycle||r_time: {eq_rcycle_rtime_claim}");
 
         let evaluations_product: Fr = evaluations.iter().fold(Fr::one(), |acc, val| acc * val);
         assert_eq!(evaluations_product, ra_address_time_claim);
         assert_eq!(val_at_r_address, val_tau_claim);
-        let final_oracle_answer = val_at_r_address * evaluations_product * eq_rcycle_rtime_claim;
+        let mut r_time_rev: Vec<Fr> = r_time.to_vec();
+        r_time_rev.reverse();
+        let eq_r_cycle_at_r_time =
+            MultilinearPolynomial::from(EqPolynomial::evals(&r_cycle)).evaluate(&r_time_rev);
+        assert_eq!(eq_r_cycle_at_r_time, eq_rcycle_rtime_claim);
+        // SOULD BE ANOTHER CHECK HERE
+
+        // I Should calculate the last one and not use the claim
+        let final_oracle_answer = val_at_r_address * evaluations_product * eq_r_cycle_at_r_time;
         assert_eq!(final_oracle_answer, final_claim);
     }
 
