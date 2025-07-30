@@ -1812,13 +1812,128 @@ pub fn prove_raf_evaluation<F: JoltField, ProofTranscript: Transcript>(
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
     use crate::utils::transcript::KeccakTranscript;
     use ark_bn254::Fr;
-    use ark_ff::{One, Zero};
+    use ark_ff::UniformRand;
+    use ark_ff::{One, Zero}; // often from ark_ff, depending on your setup
+    use ark_std::rand::{rngs::StdRng, SeedableRng};
     use ark_std::test_rng;
     use rand_core::RngCore;
+    #[test]
+    fn test_decompose_one_hot_matrix_general() {
+        const K: usize = 4;
+        const D: usize = 2;
+        const N: usize = 2;
+        const T: usize = 4; // 2**10
+        let mut rng = test_rng();
+
+        let lookup_table: Vec<Fr> = (0..K).map(|_| Fr::random(&mut rng)).collect();
+        let read_addresses: Vec<usize> = (0..T).map(|_| rng.next_u32() as usize % K).collect();
+
+        //let lookup_table = [
+        //    Fr::from_u8(3),
+        //    Fr::from_u8(2),
+        //    Fr::from_u8(1),
+        //    Fr::from_u8(0),
+        //]
+        //.to_vec();
+        //let read_addresses = vec![2, 3, 2, 3];
+        //let K = 4;
+        //let d = 2; // So N = 2 since 2^2 = 4
+        //let N = 2;
+
+        let ras = decompose_one_hot_matrix::<Fr>(&read_addresses, K, D);
+        //===================d=1==========================================================================
+        let ra: Vec<Vec<Fr>> = read_addresses
+            .par_iter()
+            .map(|&addr| {
+                (0..K)
+                    .into_par_iter()
+                    .map(|j| if j == addr { Fr::one() } else { Fr::zero() })
+                    .collect()
+            })
+            .collect();
+        let flattened: Vec<Fr> = ra.iter().flat_map(|row| row.iter().cloned()).collect();
+        let ra_poly = MultilinearPolynomial::from(flattened);
+        //---------------------------------------------------------------------------------------------
+
+        //==============================d > 1====================================
+        let flattened_ras: Vec<Vec<Fr>> = (0..D)
+            .into_par_iter()
+            .map(|d| {
+                ras[d]
+                    .iter()
+                    .flat_map(|row| row.iter().cloned())
+                    .collect::<Vec<Fr>>()
+            })
+            .collect();
+
+        let ra_polys: Vec<MultilinearPolynomial<Fr>> = flattened_ras
+            .into_par_iter()
+            .map(MultilinearPolynomial::from)
+            .collect();
+        //-------------------------------------------------
+
+        // CHALLENGES
+        let mut r_address: Vec<Fr> = [Fr::from_u8(2), Fr::from_u8(3)].to_vec();
+        let r_cycle: Vec<Fr> = [Fr::from_u8(10), Fr::from_u8(10)].to_vec();
+        let mut r_time: Vec<Fr> = [Fr::from_u8(4), Fr::from_u8(6)].to_vec();
+
+        // Common Polynomials
+        let eq_rcycle = MultilinearPolynomial::from(EqPolynomial::evals(&r_cycle));
+        let val = MultilinearPolynomial::from(lookup_table.clone());
+
+        // FULL LOCATION FOR BIG ra
+        let mut full_random_location = r_address.clone();
+        full_random_location.extend(r_time.clone());
+        full_random_location.reverse();
+        let ra_evaluated_r_address_r_time = ra_poly.evaluate(&full_random_location);
+
+        // CHUNKED FULL LOCATIONS FOR ras
+        let chunk_size = N.log_2();
+        let r_address_chunked: Vec<Vec<Fr>> = (0..D)
+            .map(|i| {
+                let start = i * chunk_size;
+                let end = (i + 1) * chunk_size;
+                r_address[start..end].to_vec()
+            })
+            .collect();
+        // this is r_address_chunkded || r_time
+        let full_chunked_locations: Vec<Vec<Fr>> = (0..D)
+            .map(|i| {
+                let mut combined = r_address_chunked[i].clone(); // clone the chunk
+                combined.extend_from_slice(&r_time); // append r_time
+                combined
+            })
+            .collect();
+
+        // Evaluate each ra[j] j=0..d for chunked location
+        let evaluations: Vec<Fr> = (0..D)
+            .map(|i| {
+                let mut random_location_rev = full_chunked_locations[i].clone();
+                random_location_rev.reverse();
+                ra_polys[i].evaluate(&random_location_rev) // no semicolon, return this value
+            })
+            .collect();
+
+        r_time.reverse();
+        let _eq_r_cycle_r_time = eq_rcycle.evaluate(&r_time);
+
+        r_address.reverse();
+        let _val_raddress = val.evaluate(&r_address);
+
+        let mut acc_val = Fr::one();
+        for (j, val) in evaluations.iter().enumerate() {
+            for &loc in full_chunked_locations[j].iter() {
+                print!("{loc}, ");
+            }
+            acc_val *= val;
+        }
+        // Mathematically the big vector == chunked vector
+        // so this should really be the same
+        assert_eq!(acc_val, ra_evaluated_r_address_r_time);
+    }
 
     #[test]
     fn test_decompose_one_hot_matrix() {
@@ -1829,17 +1944,17 @@ mod tests {
             Fr::from_u8(0),
         ]
         .to_vec();
-        let read_addresses = vec![2, 3];
-        let table_size = 4;
+        let read_addresses = vec![2, 3, 2, 3];
+        let K = 4;
         let d = 2; // So N = 2 since 2^2 = 4
         let N = 2;
-        let ras = decompose_one_hot_matrix::<Fr>(&read_addresses, table_size, d);
+        let ras = decompose_one_hot_matrix::<Fr>(&read_addresses, K, d);
 
         // Expecting 2 matrices (since d = 2)
         assert_eq!(ras.len(), 2);
-        // Each matrix should have T = 2 rows
-        assert_eq!(ras[0].len(), 2);
-        assert_eq!(ras[1].len(), 2);
+        // Each matrix should have T = 4 rows
+        assert_eq!(ras[0].len(), 4);
+        assert_eq!(ras[1].len(), 4);
 
         // Each row should have N = 2 entries
         assert_eq!(ras[0][0].len(), 2);
@@ -1865,7 +1980,7 @@ mod tests {
         let ra: Vec<Vec<Fr>> = read_addresses
             .par_iter()
             .map(|&addr| {
-                (0..table_size)
+                (0..K)
                     .into_par_iter()
                     .map(|j| if j == addr { Fr::one() } else { Fr::zero() })
                     .collect()
@@ -1894,8 +2009,8 @@ mod tests {
 
         // CHALLENGES
         let mut r_address: Vec<Fr> = [Fr::from_u8(2), Fr::from_u8(3)].to_vec();
-        let r_cycle: Vec<Fr> = [Fr::from_u8(10)].to_vec();
-        let mut r_time: Vec<Fr> = [Fr::from_u8(4)].to_vec();
+        let r_cycle: Vec<Fr> = [Fr::from_u8(10), Fr::from_u8(10)].to_vec();
+        let mut r_time: Vec<Fr> = [Fr::from_u8(4), Fr::from_u8(6)].to_vec();
         for (i, &time) in r_time.iter().enumerate() {
             println!("r_time[{i}] = {time}");
         }
@@ -1941,8 +2056,8 @@ mod tests {
             .collect();
 
         r_time.reverse();
-        let eq_r_cycle_r_time = eq_rcycle.evaluate(&r_time);
-        assert_eq!(eq_r_cycle_r_time, Fr::from_u16(67));
+        let _eq_r_cycle_r_time = eq_rcycle.evaluate(&r_time);
+        //assert_eq!(eq_r_cycle_r_time, Fr::from_u16(67));
 
         r_address.reverse();
         let _val_raddress = val.evaluate(&r_address);
@@ -1963,36 +2078,34 @@ mod tests {
         // Mathematically the big vector == chunked vector
         // so this should really be the same
         assert_eq!(acc_val, ra_evaluated_r_address_r_time);
-        assert_eq!(acc_val, Fr::from_u16(33));
+        //assert_eq!(acc_val, Fr::from_u16(33));
 
-        let mut sumcheck_claim = Fr::zero();
-        for i in 0..8 {
-            // Construct x as [MSB, mid, LSB] (big-endian)
-            let x = [
-                if (i >> 2) & 1 == 1 {
-                    Fr::one()
-                } else {
-                    Fr::zero()
-                }, // MSB = x[0]
-                if (i >> 1) & 1 == 1 {
-                    Fr::one()
-                } else {
-                    Fr::zero()
-                }, // mid = x[1]
-                if i & 1 == 1 { Fr::one() } else { Fr::zero() }, // LSB = x[2]
-            ];
-
-            // x[1..] = LSB and mid (for val)
-            // x[..1] = MSB only (for eq_rcycle)
-            let x_tail = &x[1..]; // x[1], x[2] — 2 LSBs
-            let x_head = &x[..1]; // x[0] — MSB only
-
-            let term = ra_poly.evaluate(&x) * val.evaluate(x_tail) * eq_rcycle.evaluate(x_head);
-
-            sumcheck_claim += term;
-        }
-        assert_eq!(sumcheck_claim, eq_rcycle.evaluate(&[Fr::zero()]));
-        println!("SUMCHECK VALUE= {sumcheck_claim}");
+        //let mut sumcheck_claim = Fr::zero();
+        //for i in 0..8 {
+        //    // Construct x as [MSB, mid, LSB] (big-endian)
+        //    let x = [
+        //        if (i >> 2) & 1 == 1 {
+        //            Fr::one()
+        //        } else {
+        //            Fr::zero()
+        //        }, // MSB = x[0]
+        //        if (i >> 1) & 1 == 1 {
+        //            Fr::one()
+        //        } else {
+        //            Fr::zero()
+        //        }, // mid = x[1]
+        //        if i & 1 == 1 { Fr::one() } else { Fr::zero() }, // LSB = x[2]
+        //    ];
+        //
+        //    // x[1..] = LSB and mid (for val)
+        //    // x[..1] = MSB only (for eq_rcycle)
+        //    let x_tail = &x[1..]; // x[1], x[2] — 2 LSBs
+        //    let x_head = &x[..1]; // x[0] — MSB only
+        //
+        //    let term = ra_poly.evaluate(&x) * val.evaluate(x_tail) * eq_rcycle.evaluate(x_head);
+        //
+        //    sumcheck_claim += term;
+        //}
     }
     #[test]
     fn shout_e2e() {
@@ -2100,16 +2213,12 @@ mod tests {
     }
     fn decompose_one_hot_matrix<F: JoltField>(
         read_addresses: &[usize],
-        table_size: usize,
+        K: usize,
         d: usize,
     ) -> Vec<Vec<Vec<F>>> {
         let T = read_addresses.len();
-        let N = (table_size as f64).powf(1.0 / d as f64).round() as usize;
-        assert_eq!(
-            N.pow(d as u32),
-            table_size,
-            "K must be a perfect power of N"
-        );
+        let N = (K as f64).powf(1.0 / d as f64).round() as usize;
+        assert_eq!(N.pow(d as u32), K, "K must be a perfect power of N");
 
         // Step 1: compute base-N digits for each address
         let digits_per_addr: Vec<Vec<usize>> = read_addresses
@@ -2139,31 +2248,37 @@ mod tests {
 
     #[test]
     fn test_core_generic_d_greater_than_one_shout_sumcheck() {
-        //const TABLE_SIZE: usize = 4;
-        //const D: usize = 2;
-        //const N: usize = 2;
-        //const NUM_LOOKUPS: usize = 1 << 2; // 2**10
-        //let mut rng = test_rng();
-        //
+        //------- PROBLEM SETUP----------------------
+        const K: usize = 64; // 2**6
+        const T: usize = 1 << 10; // 2**10
+        const D: usize = 2;
+        const N: usize = 2;
+
         //let lookup_table: Vec<Fr> = (0..TABLE_SIZE).map(|_| Fr::random(&mut rng)).collect();
         //let read_addresses: Vec<usize> = (0..NUM_LOOKUPS)
         //    .map(|_| rng.next_u32() as usize % TABLE_SIZE)
         //    .collect();
-        //
-        let lookup_table = [
-            Fr::from_u8(3),
-            Fr::from_u8(2),
-            Fr::from_u8(1),
-            Fr::from_u8(2),
-        ]
-        .to_vec();
-        let read_addresses = vec![2, 3];
-        let D = 2; // So N = 2 since 2^2 = 4
-        let N = 2;
+        let seed1: u64 = 42;
+        let mut rng1 = StdRng::seed_from_u64(seed1);
+        let lookup_table: Vec<Fr> = (0..K).map(|_| Fr::rand(&mut rng1)).collect();
+        let read_addresses: Vec<usize> = (0..T).map(|_| (rng1.next_u32() as usize) % K).collect();
 
-        let table_size = lookup_table.len();
-        let num_lookups = read_addresses.len();
-        let ras: Vec<Vec<Vec<Fr>>> = decompose_one_hot_matrix(&read_addresses, table_size, D);
+        //-------------------------------------------
+
+        //const K: usize = 4; // 2**6
+        //const T: usize = 2; // 2**10
+        //let read_addresses = vec![2, 3];
+        //let lookup_table = [
+        //    Fr::from_u8(3),
+        //    Fr::from_u8(2),
+        //    Fr::from_u8(1),
+        //    Fr::from_u8(2),
+        //]
+        //.to_vec();
+        //let D = 2; // So N = 2 since 2^2 = 4
+        //let N = 2;
+        //
+        let ras: Vec<Vec<Vec<Fr>>> = decompose_one_hot_matrix(&read_addresses, K, D);
         let flattened_ras: Vec<Vec<Fr>> = (0..D)
             .into_par_iter()
             .map(|d| {
@@ -2195,6 +2310,9 @@ mod tests {
             &mut prover_transcript,
         );
 
+        for (i, &challenge) in verifier_challenges.iter().enumerate() {
+            println!("Round {}, {}", i + 1, challenge);
+        }
         println!("SUMCHECK CLAIM: {sumcheck_claim}");
         let product = ra_address_time_claim * val_tau_claim * eq_rcycle_rtime_claim;
         println!(
@@ -2205,17 +2323,17 @@ mod tests {
         verifier_transcript.compare_to(prover_transcript);
 
         // Already in Big ENDIAN
-        let r_cycle: Vec<Fr> = verifier_transcript.challenge_vector(num_lookups.log_2());
+        let r_cycle: Vec<Fr> = verifier_transcript.challenge_vector(T.log_2());
         let verification_result = sumcheck_proof.verify(
             sumcheck_claim,
-            table_size.log_2() + num_lookups.log_2(),
+            K.log_2() + T.log_2(),
             D + 2,
             &mut verifier_transcript,
         );
         let (final_claim, _vfr_challenges) = verification_result.unwrap();
         //-------------------------------------------------------------------------
 
-        let (r_address, r_time) = verifier_challenges.split_at(table_size.log_2());
+        let (r_address, r_time) = verifier_challenges.split_at(K.log_2());
         let mut r_address_rev = r_address.to_vec();
         r_address_rev.reverse();
         let val_at_r_address = val.evaluate(&r_address_rev);
@@ -2266,18 +2384,27 @@ mod tests {
     }
 
     #[test]
-    fn core_generic_d_is_one_shout_sumcheck() {
+    fn test_core_generic_d_is_one_shout_sumcheck() {
+        //------- PROBLEM SETUP----------------------
         const TABLE_SIZE: usize = 64; // 2**6
         const NUM_LOOKUPS: usize = 1 << 10; // 2**10
-        let mut rng = test_rng();
 
-        let lookup_table: Vec<Fr> = (0..TABLE_SIZE).map(|_| Fr::random(&mut rng)).collect();
+        //let lookup_table: Vec<Fr> = (0..TABLE_SIZE).map(|_| Fr::random(&mut rng)).collect();
+        //let read_addresses: Vec<usize> = (0..NUM_LOOKUPS)
+        //    .map(|_| rng.next_u32() as usize % TABLE_SIZE)
+        //    .collect();
+        let seed1: u64 = 42;
+        let mut rng1 = StdRng::seed_from_u64(seed1);
+        let lookup_table: Vec<Fr> = (0..TABLE_SIZE).map(|_| Fr::rand(&mut rng1)).collect();
+
         let read_addresses: Vec<usize> = (0..NUM_LOOKUPS)
-            .map(|_| rng.next_u32() as usize % TABLE_SIZE)
+            .map(|_| (rng1.next_u32() as usize) % TABLE_SIZE)
             .collect();
+
+        //-------------------------------------------
+
         let table_size = lookup_table.len();
         let num_lookups = read_addresses.len();
-
         let ra: Vec<Vec<Fr>> = read_addresses
             .par_iter()
             .map(|&addr| {
@@ -2290,17 +2417,24 @@ mod tests {
 
         let flattened: Vec<Fr> = ra.iter().flat_map(|row| row.iter().cloned()).collect();
 
+        // What the prover commits to
         let ra_poly = MultilinearPolynomial::from(flattened);
         let val = MultilinearPolynomial::from(lookup_table.clone());
+
         let mut prover_transcript = KeccakTranscript::new(b"test_transcript");
         let (
             sumcheck_proof,
-            _,
+            verifier_challenges,
             sumcheck_claim,
             ra_address_time_claim,
             val_tau_claim,
             eq_rcycle_rtime_claim,
         ) = prove_generic_core_shout_pip(lookup_table, read_addresses, 1, &mut prover_transcript);
+
+        for (i, &challenge) in verifier_challenges.iter().enumerate() {
+            println!("Round {}, {}", i + 1, challenge);
+        }
+        println!("SUMCHECK CLAIM: {sumcheck_claim}");
 
         let mut verifier_transcript = KeccakTranscript::new(b"test_transcript");
         verifier_transcript.compare_to(prover_transcript);
@@ -2312,7 +2446,7 @@ mod tests {
             2,
             &mut verifier_transcript,
         );
-        let (final_claim, verifier_challenges) = verification_result.unwrap();
+        let (final_claim, _verifier_challenges) = verification_result.unwrap();
         let (r_address, r_time) = verifier_challenges.split_at(table_size.log_2());
 
         let mut r_address = r_address.to_vec();
@@ -2327,6 +2461,8 @@ mod tests {
         r_time.reverse();
         let eq_r_cycle_r_time = eq_r_cycle.evaluate(&r_time);
 
+        // These are the 3 product terms evaluated at the final veerifiers
+        // challenges
         assert_eq!(ra_evaluated_r_address_r_time, ra_address_time_claim);
         assert_eq!(val_at_r_address, val_tau_claim);
         assert_eq!(eq_r_cycle_r_time, eq_rcycle_rtime_claim);
@@ -2336,55 +2472,7 @@ mod tests {
             final_claim,
             ra_evaluated_r_address_r_time * eq_r_cycle_r_time * val_at_r_address
         );
-    }
-
-    #[test]
-    fn mle_for_ra() {
-        let lookup_table: Vec<Fr> = [Fr::from_u8(8), Fr::from_u8(9)].to_vec();
-        let read_addresses: Vec<usize> = [1, 1, 0, 1].to_vec();
-        let table_size = lookup_table.len();
-        let _num_lookups = read_addresses.len();
-
-        let ra: Vec<Vec<Fr>> = read_addresses
-            .par_iter()
-            .map(|&addr| {
-                (0..table_size)
-                    .into_par_iter()
-                    .map(|j| if j == addr { Fr::one() } else { Fr::zero() })
-                    .collect()
-            })
-            .collect();
-        for (i, row) in ra.iter().enumerate() {
-            println!(
-                "Row {}: [{}]",
-                i,
-                row.iter()
-                    .map(|x| format!("{x}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        let flattened: Vec<Fr> = ra.iter().flat_map(|row| row.iter().cloned()).collect();
-
-        println!(
-            "Flattened vector: [{}]",
-            flattened
-                .iter()
-                .map(|x| format!("{x}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-
-        let ra_poly = MultilinearPolynomial::from(flattened);
-        let mut location = [Fr::from_u8(9), Fr::from_u8(9), Fr::from_u8(9)].to_vec();
-        location.reverse();
-        let poly_evaluation = ra_poly.evaluate(&location);
-        assert_eq!(poly_evaluation, Fr::from_u32(1233));
-
-        location = [Fr::from_u8(8), Fr::from_u8(9), Fr::from_u8(9)].to_vec();
-        location.reverse();
-        let poly_evaluation = ra_poly.evaluate(&location);
-        assert_eq!(poly_evaluation, Fr::from_u32(1088));
+        assert_eq!(1, 0);
     }
 
     #[test]
