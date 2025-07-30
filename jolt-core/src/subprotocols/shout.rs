@@ -309,6 +309,7 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one<
     F,
     F,
     F,
+    F,
 ) {
     // This assumes that K and T are powers of 2
     let K = lookup_table.len();
@@ -359,7 +360,7 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one<
     // Binding the first log_2 K variables
     const DEGREE_ADDR: usize = 2;
     let mut compressed_polys: Vec<CompressedUniPoly<F>> = Vec::with_capacity(num_rounds);
-    for _ in 0..K.log_2() {
+    for _addr_idx in 0..K.log_2() {
         // Page 51: (eq 51)
         let univariate_poly_evals: [F; DEGREE_ADDR] = (0..ra.len() / 2)
             .into_par_iter()
@@ -386,12 +387,7 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one<
 
         // Get challenge that binds the variable
         let r_j = transcript.challenge_scalar::<F>();
-        //let r_j = match debug_count {
-        //    0 => F::from_u8(2),
-        //    1 => F::from_u8(3),
-        //    2 => F::from_u8(4),
-        //    _ => F::one(), // fallback case if needed
-        //};
+
         r_address.push(r_j);
         previous_claim = univariate_poly.evaluate(&r_j);
         //println!("r_address[{debug_count}] = {r_j}");
@@ -439,7 +435,7 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one<
         E.into_par_iter().map(MultilinearPolynomial::from).collect();
 
     let DEGREE_TME: usize = d + 2;
-    for _ in 0..T.log_2() {
+    for _time_round_idx in 0..T.log_2() {
         let univariate_poly_evals: Vec<F> = (0..ra_taus[0].len() / 2)
             .into_par_iter()
             .map(|index| {
@@ -496,15 +492,8 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one<
 
         // Get challenge that binds the variable
         let r_j = transcript.challenge_scalar::<F>();
-        //let r_j = match debug_count {
-        //    0 => F::from_u8(2),
-        //    1 => F::from_u8(3),
-        //    2 => F::from_u8(4),
-        //    _ => F::one(), // fallback case if needed
-        //};
-
         r_address.push(r_j);
-
+        previous_claim = univariate_poly.evaluate(&r_j);
         rayon::join(
             || {
                 ra_taus.par_iter_mut().for_each(|ra_tau| {
@@ -529,6 +518,7 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one<
         ras_raddress_rtime_product,
         val_claim,
         eq_r_cycle_at_r_time,
+        previous_claim,
     )
 }
 
@@ -2251,23 +2241,21 @@ mod tests {
         //------- PROBLEM SETUP----------------------
         const K: usize = 64; // 2**6
         const T: usize = 1 << 10; // 2**10
-        const D: usize = 2;
-        const N: usize = 2;
+        const D: usize = 3;
+        let N = (K as f64).powf(1.0 / D as f64).round() as usize;
+        assert_eq!(N.pow(D as u32), K, "K must be a perfect power of N");
 
-        //let lookup_table: Vec<Fr> = (0..TABLE_SIZE).map(|_| Fr::random(&mut rng)).collect();
-        //let read_addresses: Vec<usize> = (0..NUM_LOOKUPS)
-        //    .map(|_| rng.next_u32() as usize % TABLE_SIZE)
-        //    .collect();
         let seed1: u64 = 42;
         let mut rng1 = StdRng::seed_from_u64(seed1);
         let lookup_table: Vec<Fr> = (0..K).map(|_| Fr::rand(&mut rng1)).collect();
         let read_addresses: Vec<usize> = (0..T).map(|_| (rng1.next_u32() as usize) % K).collect();
-
         //-------------------------------------------
-
-        //const K: usize = 4; // 2**6
-        //const T: usize = 2; // 2**10
-        //let read_addresses = vec![2, 3];
+        // DEBUG data
+        //const D: usize = 2;
+        //const N: usize = 2;
+        //const K: usize = 4;
+        //const T: usize = 4;
+        //let read_addresses = vec![2, 3, 2, 3];
         //let lookup_table = [
         //    Fr::from_u8(3),
         //    Fr::from_u8(2),
@@ -2275,9 +2263,10 @@ mod tests {
         //    Fr::from_u8(2),
         //]
         //.to_vec();
-        //let D = 2; // So N = 2 since 2^2 = 4
-        //let N = 2;
-        //
+        //---------------------------------------------
+
+        assert_eq!(T, read_addresses.len());
+        assert_eq!(K, lookup_table.len());
         let ras: Vec<Vec<Vec<Fr>>> = decompose_one_hot_matrix(&read_addresses, K, D);
         let flattened_ras: Vec<Vec<Fr>> = (0..D)
             .into_par_iter()
@@ -2303,6 +2292,7 @@ mod tests {
             ra_address_time_claim,
             val_tau_claim,
             eq_rcycle_rtime_claim,
+            _final_claim,
         ) = prove_generic_core_shout_pip_d_greater_than_one(
             lookup_table,
             read_addresses,
@@ -2352,6 +2342,7 @@ mod tests {
         let full_random_locations: Vec<Vec<Fr>> = (0..D)
             .map(|i| {
                 let mut combined = r_address_chunked[i].clone(); // clone the chunk
+                assert_eq!(combined.len(), N.log_2());
                 combined.extend_from_slice(r_time); // append r_time
                 combined
             })
@@ -2361,6 +2352,7 @@ mod tests {
             .map(|i| {
                 let mut random_location_rev = full_random_locations[i].clone();
                 random_location_rev.reverse();
+                assert_eq!(random_location_rev.len(), T.log_2() + N.log_2());
                 ra_polys[i].evaluate(&random_location_rev) // no semicolon, return this value
             })
             .collect();
@@ -2376,7 +2368,6 @@ mod tests {
         let eq_r_cycle_at_r_time =
             MultilinearPolynomial::from(EqPolynomial::evals(&r_cycle)).evaluate(&r_time_rev);
         assert_eq!(eq_r_cycle_at_r_time, eq_rcycle_rtime_claim);
-        // SOULD BE ANOTHER CHECK HERE
 
         // I Should calculate the last one and not use the claim
         let final_oracle_answer = val_at_r_address * evaluations_product * eq_r_cycle_at_r_time;
