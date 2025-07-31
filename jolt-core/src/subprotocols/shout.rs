@@ -2130,7 +2130,7 @@ mod tests {
     }
 
     #[test]
-    fn core_shout_sumcheck() {
+    fn test_core_shout_sumcheck() {
         const TABLE_SIZE: usize = 64;
         const NUM_LOOKUPS: usize = 1 << 10;
 
@@ -2249,24 +2249,10 @@ mod tests {
         let mut rng1 = StdRng::seed_from_u64(seed1);
         let lookup_table: Vec<Fr> = (0..K).map(|_| Fr::rand(&mut rng1)).collect();
         let read_addresses: Vec<usize> = (0..T).map(|_| (rng1.next_u32() as usize) % K).collect();
-        //-------------------------------------------
-        // DEBUG data
-        //const D: usize = 2;
-        //const N: usize = 2;
-        //const K: usize = 4;
-        //const T: usize = 4;
-        //let read_addresses = vec![2, 3, 2, 3];
-        //let lookup_table = [
-        //    Fr::from_u8(3),
-        //    Fr::from_u8(2),
-        //    Fr::from_u8(1),
-        //    Fr::from_u8(2),
-        //]
-        //.to_vec();
-        //---------------------------------------------
-
         assert_eq!(T, read_addresses.len());
         assert_eq!(K, lookup_table.len());
+        //-------------------------------------------------
+
         let ras: Vec<Vec<Vec<Fr>>> = decompose_one_hot_matrix(&read_addresses, K, D);
         let flattened_ras: Vec<Vec<Fr>> = (0..D)
             .into_par_iter()
@@ -2463,7 +2449,6 @@ mod tests {
             final_claim,
             ra_evaluated_r_address_r_time * eq_r_cycle_r_time * val_at_r_address
         );
-        assert_eq!(1, 0);
     }
 
     #[test]
