@@ -4,6 +4,16 @@
 use super::dense_mlpoly::DensePolynomial;
 use crate::{field::JoltField, poly::eq_poly::EqPolynomial};
 
+/// Old struct for split equality polynomial, without Gruen's optimization
+/// TODO: remove all usage of this struct with the new one
+pub struct SplitEqPolynomial<F> {
+    num_vars: usize,
+    pub(crate) E1: Vec<F>,
+    pub(crate) E1_len: usize,
+    pub(crate) E2: Vec<F>,
+    pub(crate) E2_len: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 /// A struct holding the equality polynomial evaluations for use in sum-check, when incorporating
 /// both the Gruen and Dao-Thaler optimizations.
@@ -26,19 +36,10 @@ pub struct GruenSplitEqPolynomial<F> {
     pub(crate) E_out_vec: Vec<Vec<F>>,
 }
 
-/// Old struct for split equality polynomial, without Gruen's optimization
-/// TODO: remove all usage of this struct with the new one
-pub struct SplitEqPolynomial<F> {
-    num_vars: usize,
-    pub(crate) E1: Vec<F>,
-    pub(crate) E1_len: usize,
-    pub(crate) E2: Vec<F>,
-    pub(crate) E2_len: usize,
-}
-
 impl<F: JoltField> GruenSplitEqPolynomial<F> {
     #[tracing::instrument(skip_all, name = "GruenSplitEqPolynomial::new")]
     pub fn new(w: &[F]) -> Self {
+        // NOTE: w is Big-Endian i.e the Least sig digit is stored in the last loc
         let m = w.len() / 2;
         //   w = [w_out, w_in, w_last]
         //         ↑      ↑      ↑
@@ -165,6 +166,20 @@ impl<F: JoltField> GruenSplitEqPolynomial<F> {
     /// Return the last vector from `E2` as a slice
     pub fn E_out_current(&self) -> &[F] {
         self.E_out_vec.last().unwrap()
+    }
+
+    pub fn get_current_round_constant(&self, eval_loc: F) -> F {
+        let prod_w_z = self.w[self.current_index - 1] * eval_loc;
+        self.current_scalar
+            * (F::one() - self.w[self.current_index - 1] - eval_loc + prod_w_z + prod_w_z)
+    }
+
+    pub fn get_current_scalar(&self) -> F {
+        self.current_scalar
+    }
+
+    pub fn get_current_w(&self) -> F {
+        self.w[self.current_index - 1]
     }
 
     #[tracing::instrument(skip_all, name = "GruenSplitEqPolynomial::bind")]
