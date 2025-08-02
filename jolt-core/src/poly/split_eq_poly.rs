@@ -168,12 +168,6 @@ impl<F: JoltField> GruenSplitEqPolynomial<F> {
         self.E_out_vec.last().unwrap()
     }
 
-    pub fn get_current_round_constant(&self, eval_loc: F) -> F {
-        let prod_w_z = self.w[self.current_index - 1] * eval_loc;
-        self.current_scalar
-            * (F::one() - self.w[self.current_index - 1] - eval_loc + prod_w_z + prod_w_z)
-    }
-
     pub fn get_current_scalar(&self) -> F {
         self.current_scalar
     }
