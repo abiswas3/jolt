@@ -18,6 +18,23 @@ use crate::{
     },
 };
 use rayon::prelude::*;
+use std::time::Instant;
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+// Global counter
+static MULT_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub struct CountingField<F: JoltField>(pub F);
+impl<F: JoltField> CountingField<F> {
+    pub fn reset_count() {
+        MULT_COUNT.store(0, Ordering::Relaxed);
+    }
+    pub fn mult_count() -> usize {
+        MULT_COUNT.load(Ordering::Relaxed)
+    }
+}
 
 pub struct ShoutProof<F: JoltField, ProofTranscript: Transcript> {
     sumcheck_proof: SumcheckInstanceProof<F, ProofTranscript>,
@@ -436,40 +453,78 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
         // It T = 2^32 each E_1, E_2 is roughly 2^16
         // so we only want to parallelise over inner loop
         let mut evals_of_t: Vec<F> = (0..E_1.len())
-            .map(|x1| {
-                let inner_sum: Vec<F> = (0..E_2.len())
-                    .into_par_iter()
-                    .map(|x2| {
-                        let idx = x1 * E_2.len() + x2;
+            .flat_map(|x1| (0..E_2.len()).map(move |x2| (x1, x2)))
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|(x1, x2)| {
+                let idx = x1 * E_2.len() + x2;
 
-                        let ra_evals_per_tau: Vec<Vec<F>> = ra_taus
+                // Compute all ra_tau evaluations for this (x1, x2)
+                let ra_evals_per_tau: Vec<Vec<F>> = ra_taus
+                    .iter()
+                    .map(|ra_tau| ra_tau.sumcheck_evals(idx, degree, BindingOrder::LowToHigh))
+                    .collect();
+
+                // Compute product across ra_taus for each degree position
+                let eval: Vec<F> = (0..degree)
+                    .map(|i| {
+                        ra_evals_per_tau
                             .iter()
-                            .map(|ra_tau| {
-                                ra_tau.sumcheck_evals(idx, degree, BindingOrder::LowToHigh)
-                            })
-                            .collect();
-
-                        let eval: Vec<F> = (0..degree)
-                            .map(|i| {
-                                ra_evals_per_tau
-                                    .par_iter()
-                                    .map(|row| row[i])
-                                    .reduce(|| F::one(), |a, b| a * b)
-                            })
-                            .collect();
-
-                        eval.iter().map(|e| E_2[x2] * *e).collect::<Vec<F>>()
+                            .map(|row| row[i])
+                            .reduce(|a, b| a * b)
+                            .unwrap_or_else(F::one) // handle empty case
                     })
-                    .reduce_with(|a, b| a.iter().zip(&b).map(|(x, y)| *x + *y).collect())
-                    .unwrap_or_else(|| vec![F::zero(); degree]);
+                    .collect();
 
-                inner_sum
-                    .into_iter()
-                    .map(|val| val * E_1[x1])
-                    .collect::<Vec<F>>()
+                // Scale by E_1[x1] * E_2[x2]
+                let coeff = E_1[x1] * E_2[x2];
+                eval.into_iter().map(|e| coeff * e).collect::<Vec<F>>()
             })
-            .reduce(|a, b| a.iter().zip(&b).map(|(x, y)| *x + *y).collect())
-            .unwrap_or_else(|| vec![F::zero(); degree]);
+            .reduce(
+                || vec![F::zero(); degree],
+                |mut acc, v| {
+                    for (a, b) in acc.iter_mut().zip(v) {
+                        *a += b;
+                    }
+                    acc
+                },
+            );
+
+        //let mut evals_of_t: Vec<F> = (0..E_1.len())
+        //    .map(|x1| {
+        //        let inner_sum: Vec<F> = (0..E_2.len())
+        //            .into_par_iter()
+        //            .map(|x2| {
+        //                let idx = x1 * E_2.len() + x2;
+        //
+        //                let ra_evals_per_tau: Vec<Vec<F>> = ra_taus
+        //                    .iter()
+        //                    .map(|ra_tau| {
+        //                        ra_tau.sumcheck_evals(idx, degree, BindingOrder::LowToHigh)
+        //                    })
+        //                    .collect();
+        //
+        //                let eval: Vec<F> = (0..degree)
+        //                    .map(|i| {
+        //                        ra_evals_per_tau
+        //                            .par_iter()
+        //                            .map(|row| row[i])
+        //                            .reduce(|| F::one(), |a, b| a * b)
+        //                    })
+        //                    .collect();
+        //
+        //                eval.iter().map(|e| E_2[x2] * *e).collect::<Vec<F>>()
+        //            })
+        //            .reduce_with(|a, b| a.iter().zip(&b).map(|(x, y)| *x + *y).collect())
+        //            .unwrap_or_else(|| vec![F::zero(); degree]);
+        //
+        //        inner_sum
+        //            .into_iter()
+        //            .map(|val| val * E_1[x1])
+        //            .collect::<Vec<F>>()
+        //    })
+        //    .reduce(|a, b| a.iter().zip(&b).map(|(x, y)| *x + *y).collect())
+        //    .unwrap_or_else(|| vec![F::zero(); degree]);
 
         let ell_at_0 = val_claim
             * greq_r_cycle.get_current_scalar()
@@ -909,10 +964,10 @@ pub fn prove_generic_core_shout_piop_d_is_one_w_gruen<F: JoltField, ProofTranscr
     // A random field element F^{\log_2 T} for Schwartz-Zippll
     // This is stored in Big Endian
     let r_cycle: Vec<F> = transcript.challenge_vector(T.log_2());
-    //let r_cycle: Vec<F> = (0..T.log_2()).map(|_| F::from_u8(11)).collect();
     // Page 50: eq(44)
     let E_star: Vec<F> = EqPolynomial::evals(&r_cycle);
     // Page 50: eq(47) : what the paper calls v_k
+
     // This is sub-optimal -> TODO
     let C: Vec<_> = (0..K) // This is C[x] = ra(r_cycle, x)
         .into_par_iter()
@@ -937,8 +992,8 @@ pub fn prove_generic_core_shout_piop_d_is_one_w_gruen<F: JoltField, ProofTranscr
     // Note that it does not matter whether d=1 or d > 1
     // The final sum-check answer is the same.
     let sumcheck_claim: F = C
-        .par_iter()
-        .zip(lookup_table.par_iter())
+        .iter()
+        .zip(lookup_table.iter())
         .map(|(&ra, &val)| ra * val)
         .sum();
 
@@ -1016,46 +1071,63 @@ pub fn prove_generic_core_shout_piop_d_is_one_w_gruen<F: JoltField, ProofTranscr
         let E_1 = greq_r_cycle.E_out_current();
 
         let degree = 1;
+        //let start = Instant::now();
         let mut evals_of_t: Vec<F> = (0..E_1.len())
-            .map(|x1| {
-                let inner_sum: Vec<F> = (0..E_2.len())
-                    .map(|x2| {
-                        let idx = x1 * E_2.len() + x2;
-                        let eval: Vec<F> =
-                            ra_tau.sumcheck_evals(idx, degree, BindingOrder::LowToHigh);
-                        eval.iter().map(|e| E_2[x2] * *e).collect::<Vec<F>>()
-                    })
-                    .reduce(|a, b| a.iter().zip(&b).map(|(x, y)| *x + *y).collect())
-                    .unwrap_or_else(|| vec![F::zero(); degree]);
-
-                inner_sum
-                    .into_iter()
-                    .map(|val| val * E_1[x1])
-                    .collect::<Vec<F>>()
+            .flat_map(|x1| (0..E_2.len()).map(move |x2| (x1, x2)))
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|(x1, x2)| {
+                let idx = x1 * E_2.len() + x2;
+                let evals = ra_tau.sumcheck_evals(idx, degree, BindingOrder::LowToHigh);
+                let coeff = E_1[x1] * E_2[x2];
+                evals.into_iter().map(|e| coeff * e).collect::<Vec<F>>()
             })
-            .reduce(|a, b| a.iter().zip(&b).map(|(x, y)| *x + *y).collect())
-            .unwrap_or_else(|| vec![F::zero(); degree]);
+            .reduce(
+                || vec![F::zero(); degree],
+                |mut acc, v| {
+                    for (a, b) in acc.iter_mut().zip(v) {
+                        *a += b;
+                    }
+                    acc
+                },
+            );
+
+        //let duration = start.elapsed();
+        //println!(
+        //"Size: {} Evals (t): Execution time: {}",
+        //E_1.len() * E_2.len(),
+        //duration.as_millis()
+        //);
 
         // Procedure 8
+        // 2 MULTS per round
         let ell_at_0 = val_claim
             * greq_r_cycle.get_current_scalar()
             * (F::one() - greq_r_cycle.get_current_w());
         let ell_at_1 = val_claim * greq_r_cycle.get_current_scalar() * greq_r_cycle.get_current_w();
 
+        // One inverse
         let ell_one_inverse = ell_at_1
             .inverse()
             .expect("Tried to invert zero (ell_at_1 has no inverse)");
         let t_at_zero = evals_of_t[0];
+
+        // 2 Mults per round
         let t_at_one = ell_one_inverse * (previous_claim - t_at_zero * ell_at_0);
 
         evals_of_t.insert(1, t_at_one);
-        let t_x = UniPoly::from_evals(&evals_of_t);
-        let t_at_two = t_x.evaluate(&F::from_u8(2));
+
+        // when d = 1; t is also a linear polynomial
+        //let t_x = UniPoly::from_evals(&evals_of_t);
+        //let t_at_two = t_x.evaluate(&F::from_u8(2));
+        let t_at_two = t_at_one + t_at_one - t_at_zero;
+
         let ell_at_two = ell_at_1 + ell_at_1 - ell_at_0;
         let s_at_two = ell_at_two * t_at_two;
 
         // Construct coefficients of univariate polynomial from evaluations
         // This still needs 3 points
+        // 3 mults per rounds
         let univariate_poly =
             UniPoly::from_evals(&[ell_at_0 * t_at_zero, ell_at_1 * t_at_one, s_at_two]);
 
@@ -1068,10 +1140,8 @@ pub fn prove_generic_core_shout_piop_d_is_one_w_gruen<F: JoltField, ProofTranscr
         let r_j = transcript.challenge_scalar::<F>();
         r_address.push(r_j);
         previous_claim = univariate_poly.evaluate(&r_j);
-        rayon::join(
-            || ra_tau.bind_parallel(r_j, BindingOrder::LowToHigh),
-            || greq_r_cycle.bind(r_j),
-        );
+        ra_tau.bind_parallel(r_j, BindingOrder::LowToHigh);
+        greq_r_cycle.bind(r_j);
     }
 
     let ra_tau_claim = ra_tau.final_sumcheck_claim();
@@ -1108,7 +1178,6 @@ pub fn prove_generic_core_shout_pip<F: JoltField, ProofTranscript: Transcript>(
     // A random field element F^{\log_2 T} for Schwartz-Zippll
     // This is stored in Big Endian
     let r_cycle: Vec<F> = transcript.challenge_vector(T.log_2());
-    //let r_cycle: Vec<F> = (0..T.log_2()).map(|_| F::from_u8(11)).collect();
     // Page 50: eq(44)
     let E_star: Vec<F> = EqPolynomial::evals(&r_cycle);
     // Page 50: eq(47) : what the paper calls v_k
@@ -1137,8 +1206,8 @@ pub fn prove_generic_core_shout_pip<F: JoltField, ProofTranscript: Transcript>(
 
     // The sum check answer (for d=1, it's the same as normal one)
     let sumcheck_claim: F = C
-        .par_iter()
-        .zip(lookup_table.par_iter())
+        .iter()
+        .zip(lookup_table.iter())
         .map(|(&ra, &val)| ra * val)
         .sum();
 
@@ -1202,6 +1271,7 @@ pub fn prove_generic_core_shout_pip<F: JoltField, ProofTranscript: Transcript>(
     let mut ra_tau = MultilinearPolynomial::from(E);
 
     for _round_time in 0..T.log_2() {
+        //let start = Instant::now();
         let univariate_poly_evals: [F; 2] = (0..ra_tau.len() / 2)
             .into_par_iter()
             .map(|index| {
@@ -1214,6 +1284,12 @@ pub fn prove_generic_core_shout_pip<F: JoltField, ProofTranscript: Transcript>(
                 |running, new| [running[0] + new[0], running[1] + new[1]],
             );
 
+        //let duration = start.elapsed();
+        //println!(
+        //    "Size: {} Time taken wit no gruen: {}",
+        //    ra_tau.len(),
+        //    duration.as_millis()
+        //);
         let univariate_poly = UniPoly::from_evals(&[
             val_claim * univariate_poly_evals[0],
             previous_claim - val_claim * univariate_poly_evals[0],
