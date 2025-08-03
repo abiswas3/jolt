@@ -435,7 +435,7 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
 
         // It T = 2^32 each E_1, E_2 is roughly 2^16
         // so we only want to parallelise over inner loop
-        let ra_evals_at_x1_x2: Vec<F> = (0..E_1.len())
+        let mut evals_of_t: Vec<F> = (0..E_1.len())
             .map(|x1| {
                 let inner_sum: Vec<F> = (0..E_2.len())
                     .into_par_iter()
@@ -475,30 +475,36 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
             * greq_r_cycle.get_current_scalar()
             * (F::one() - greq_r_cycle.get_current_w());
         let ell_at_1 = val_claim * greq_r_cycle.get_current_scalar() * greq_r_cycle.get_current_w();
-        let ell_x = UniPoly::from_evals(&[ell_at_0, ell_at_1]);
+        //let ell_x = UniPoly::from_evals(&[ell_at_0, ell_at_1]);
+
+        // ell is linear
+        let mut d_plus_three_evaluations_of_ell: Vec<F> = vec![F::zero(); d + 3];
+        d_plus_three_evaluations_of_ell[0] = ell_at_0;
+        let m = ell_at_1 - ell_at_0;
+        let mut eval = ell_at_1;
+        for i in 1..(d + 3) {
+            d_plus_three_evaluations_of_ell[i] = eval;
+            eval += m;
+        }
 
         let ell_one_inverse = ell_at_1
             .inverse()
             .expect("Tried to invert zero (ell_at_1 has no inverse)");
 
-        let t_at_zero = ra_evals_at_x1_x2[0];
+        let t_at_zero = evals_of_t[0];
         let t_at_one = ell_one_inverse * (previous_claim - t_at_zero * ell_at_0);
 
-        let d_plus_two_evaluations_of_t: Vec<F> = (0..=degree)
-            .map(|i| match i {
-                0 => ra_evals_at_x1_x2[0],
-                1 => t_at_one,
-                _ => ra_evals_at_x1_x2[i - 1],
-            })
-            .collect();
+        evals_of_t.insert(1, t_at_one);
+        // d + 2 evaluations of t are sufficient to construct the polynomial
+        let t_x = UniPoly::from_evals(&evals_of_t);
 
-        let t_x = UniPoly::from_evals(&d_plus_two_evaluations_of_t);
-
-        let d_plus_three_evaluations: Vec<_> = (0..=degree + 1)
-            .map(|i| match i {
-                0 => t_at_zero * ell_at_0,
-                1 => t_at_one * ell_at_1,
-                _ => t_x.evaluate(&F::from_u8(i as u8)) * ell_x.evaluate(&F::from_u8(i as u8)),
+        let d_plus_three_evaluations: Vec<F> = (0..(d + 3))
+            .map(|i| {
+                if i == d + 2 {
+                    t_x.evaluate(&F::from_u16(i as u16)) * d_plus_three_evaluations_of_ell[i]
+                } else {
+                    evals_of_t[i] * d_plus_three_evaluations_of_ell[i]
+                }
             })
             .collect();
 
@@ -1010,7 +1016,7 @@ pub fn prove_generic_core_shout_piop_d_is_one_w_gruen<F: JoltField, ProofTranscr
         let E_1 = greq_r_cycle.E_out_current();
 
         let degree = 1;
-        let ra_evals_at_x1_x2: Vec<F> = (0..E_1.len())
+        let mut evals_of_t: Vec<F> = (0..E_1.len())
             .map(|x1| {
                 let inner_sum: Vec<F> = (0..E_2.len())
                     .map(|x2| {
@@ -1035,17 +1041,18 @@ pub fn prove_generic_core_shout_piop_d_is_one_w_gruen<F: JoltField, ProofTranscr
             * greq_r_cycle.get_current_scalar()
             * (F::one() - greq_r_cycle.get_current_w());
         let ell_at_1 = val_claim * greq_r_cycle.get_current_scalar() * greq_r_cycle.get_current_w();
-        let ell_x = UniPoly::from_evals(&[ell_at_0, ell_at_1]);
 
-        //let ell_one_inverse = ell_at_1.inverse().unwrap();
         let ell_one_inverse = ell_at_1
             .inverse()
             .expect("Tried to invert zero (ell_at_1 has no inverse)");
-        let t_at_zero = ra_evals_at_x1_x2[0];
+        let t_at_zero = evals_of_t[0];
         let t_at_one = ell_one_inverse * (previous_claim - t_at_zero * ell_at_0);
-        let t_univariate_poly = UniPoly::from_evals(&[t_at_zero, t_at_one]);
 
-        let s_at_two = t_univariate_poly.evaluate(&F::from_u8(2)) * ell_x.evaluate(&F::from_u8(2));
+        evals_of_t.insert(1, t_at_one);
+        let t_x = UniPoly::from_evals(&evals_of_t);
+        let t_at_two = t_x.evaluate(&F::from_u8(2));
+        let ell_at_two = ell_at_1 + ell_at_1 - ell_at_0;
+        let s_at_two = ell_at_two * t_at_two;
 
         // Construct coefficients of univariate polynomial from evaluations
         // This still needs 3 points
@@ -1194,7 +1201,7 @@ pub fn prove_generic_core_shout_pip<F: JoltField, ProofTranscript: Transcript>(
     });
     let mut ra_tau = MultilinearPolynomial::from(E);
 
-    for round_time in 0..T.log_2() {
+    for _round_time in 0..T.log_2() {
         let univariate_poly_evals: [F; 2] = (0..ra_tau.len() / 2)
             .into_par_iter()
             .map(|index| {
