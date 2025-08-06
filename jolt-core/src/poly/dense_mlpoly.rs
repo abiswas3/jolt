@@ -392,39 +392,22 @@ impl<F: JoltField> DensePolynomial<F> {
     }
 
     pub fn evaluate_at_chi_split_eq(&self, eq_one: &[F], eq_two: &[F]) -> F {
-        if eq_one.len().log_2() + eq_two.len().log_2() < 16 {
-            let eval: F = (0..eq_one.len())
-                .flat_map(|x1| (0..eq_two.len()).map(move |x2| (x1, x2)))
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|(x1, x2)| {
-                    let idx = x1 * eq_two.len() + x2;
-                    if self.Z[idx].is_zero() || eq_one[x1].is_zero() || eq_two[x2].is_zero() {
-                        F::zero()
-                    } else {
-                        let coef = OptimizedMul::mul_01_optimized(self.Z[idx], eq_two[x2]);
-                        OptimizedMul::mul_01_optimized(eq_one[x1], coef)
-                    }
-                })
-                .fold(F::zero(), |acc, v| acc + v);
-            eval
-        } else {
-            let eval: F = (0..eq_one.len())
-                .flat_map(|x1| (0..eq_two.len()).map(move |x2| (x1, x2)))
-                .collect::<Vec<_>>()
-                .into_par_iter()
-                .map(|(x1, x2)| {
-                    let idx = x1 * eq_two.len() + x2;
-                    if self.Z[idx].is_zero() || eq_one[x1].is_zero() || eq_two[x2].is_zero() {
-                        F::zero()
-                    } else {
-                        let coef = OptimizedMul::mul_01_optimized(self.Z[idx], eq_two[x2]);
-                        OptimizedMul::mul_01_optimized(eq_one[x1], coef)
-                    }
-                })
-                .reduce(|| F::zero(), |acc, v| acc + v);
-            eval
-        }
+        // Serial and parallel based on the size of the the problem
+        let eval: F = (0..eq_one.len())
+            .flat_map(|x1| (0..eq_two.len()).map(move |x2| (x1, x2)))
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|(x1, x2)| {
+                let idx = x1 * eq_two.len() + x2;
+                if self.Z[idx].is_zero() || eq_one[x1].is_zero() || eq_two[x2].is_zero() {
+                    F::zero()
+                } else {
+                    let coef = OptimizedMul::mul_01_optimized(self.Z[idx], eq_two[x2]);
+                    OptimizedMul::mul_01_optimized(eq_one[x1], coef)
+                }
+            })
+            .reduce(|| F::zero(), |acc, v| acc + v);
+        eval
     }
 
     pub fn evaluate_at_chi_low_optimized(&self, chis: &[F]) -> F {
@@ -483,13 +466,13 @@ impl<F: JoltField> PolynomialEvaluation<F> for DensePolynomial<F> {
         self.evaluate(r)
     }
 
-    fn batch_evaluate(polys: &[&Self], r: &[F]) -> (Vec<F>, Vec<F>) {
+    fn batch_evaluate(polys: &[&Self], r: &[F]) -> Vec<F> {
         let eq = EqPolynomial::evals(r);
         let evals: Vec<F> = polys
             .into_par_iter()
             .map(|&poly| poly.evaluate_at_chi_low_optimized(&eq))
             .collect();
-        (evals, eq)
+        evals
     }
 
     fn sumcheck_evals(&self, index: usize, degree: usize, order: BindingOrder) -> Vec<F> {

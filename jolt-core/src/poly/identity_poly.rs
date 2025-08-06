@@ -94,7 +94,7 @@ impl<F: JoltField> PolynomialEvaluation<F> for IdentityPolynomial<F> {
         }
     }
 
-    fn batch_evaluate(_polys: &[&Self], _r: &[F]) -> (Vec<F>, Vec<F>) {
+    fn batch_evaluate(_polys: &[&Self], _r: &[F]) -> Vec<F> {
         unimplemented!("Currently unused")
     }
 
@@ -268,7 +268,7 @@ impl<F: JoltField> PolynomialEvaluation<F> for OperandPolynomial<F> {
         }
     }
 
-    fn batch_evaluate(_polys: &[&Self], _r: &[F]) -> (Vec<F>, Vec<F>) {
+    fn batch_evaluate(_polys: &[&Self], _r: &[F]) -> Vec<F> {
         unimplemented!("Currently unused")
     }
 
@@ -475,7 +475,7 @@ impl<F: JoltField> PolynomialEvaluation<F> for UnmapRamAddressPolynomial<F> {
         F::from_u64(4) * sum + F::from_u64(self.start_address - 4) * (F::one() - prod)
     }
 
-    fn batch_evaluate(_polys: &[&Self], _r: &[F]) -> (Vec<F>, Vec<F>) {
+    fn batch_evaluate(_polys: &[&Self], _r: &[F]) -> Vec<F> {
         unimplemented!("Unused")
     }
 

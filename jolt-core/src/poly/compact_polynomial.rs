@@ -152,22 +152,35 @@ impl<T: SmallScalar, F: JoltField> CompactPolynomial<T, F> {
         self.coeffs.par_iter().map(|x| x.to_field()).collect()
     }
 
-    pub fn split_eq_evaluate(&self, r: &[F]) -> F {
+    pub fn batch_split_eq_evaluate(&self, r: &[F], eq_one: &[F], eq_two: &[F]) -> F {
         const PARALLEL_THRESHOLD: usize = 16;
         // r must have a value for each variable
         assert_eq!(r.len(), self.get_num_vars());
         let m = r.len();
         if m < PARALLEL_THRESHOLD {
-            self.evaluate_split_eq_serial(r)
+            self.evaluate_split_eq_serial(eq_one, eq_two)
         } else {
-            self.evaluate_split_eq_parallel(r)
+            self.evaluate_split_eq_parallel(eq_one, eq_two)
         }
     }
 
-    fn evaluate_split_eq_parallel(&self, r: &[F]) -> F {
+    pub fn split_eq_evaluate(&self, r: &[F]) -> F {
         let m = r.len() / 2;
         let (r2, r1) = r.split_at(m);
         let (eq_one, eq_two) = rayon::join(|| EqPolynomial::evals(r2), || EqPolynomial::evals(r1));
+
+        const PARALLEL_THRESHOLD: usize = 16;
+        // r must have a value for each variable
+        assert_eq!(r.len(), self.get_num_vars());
+        let m = r.len();
+        if m < PARALLEL_THRESHOLD {
+            self.evaluate_split_eq_serial(&eq_one, &eq_two)
+        } else {
+            self.evaluate_split_eq_parallel(&eq_one, &eq_two)
+        }
+    }
+
+    fn evaluate_split_eq_parallel(&self, eq_one: &[F], eq_two: &[F]) -> F {
         let eval: F = (0..eq_one.len())
             .flat_map(|x1| (0..eq_two.len()).map(move |x2| (x1, x2)))
             .collect::<Vec<_>>()
@@ -190,10 +203,7 @@ impl<T: SmallScalar, F: JoltField> CompactPolynomial<T, F> {
 
         eval
     }
-    fn evaluate_split_eq_serial(&self, r: &[F]) -> F {
-        let m = r.len() / 2;
-        let (r2, r1) = r.split_at(m);
-        let (eq_one, eq_two) = rayon::join(|| EqPolynomial::evals(r2), || EqPolynomial::evals(r1));
+    fn evaluate_split_eq_serial(&self, eq_one: &[F], eq_two: &[F]) -> F {
         let eval: F = (0..eq_one.len())
             .flat_map(|x1| (0..eq_two.len()).map(move |x2| (x1, x2)))
             .collect::<Vec<_>>()

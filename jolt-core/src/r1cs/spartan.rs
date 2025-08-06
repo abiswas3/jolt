@@ -206,8 +206,12 @@ where
         // Evaluate all witness polynomials P_i at r_cycle for the verifier
         // Verifier computes: z(r_inner, r_cycle) = Σ_i eq(r_inner, i) * P_i(r_cycle)
         let flattened_polys_ref: Vec<_> = input_polys.iter().collect();
-        let (claimed_witness_evals, chis) =
+        let claimed_witness_evals =
             MultilinearPolynomial::batch_evaluate(&flattened_polys_ref, r_cycle);
+        // THIS IS VERY BAD -- it gets rid of all the gains of split-eq in the first place
+        // FIXME!
+        // We changed the batch_evaluate interface to just return evalions
+        let chis = EqPolynomial::evals(r_cycle);
 
         let (_, eq_plus_one_r_cycle) = EqPlusOnePolynomial::evals(r_cycle, None);
 

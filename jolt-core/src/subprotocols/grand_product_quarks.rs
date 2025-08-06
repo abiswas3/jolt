@@ -411,8 +411,9 @@ where
         // 3. f(r_sumcheck, 1)
 
         // We have a commitment to g(x) = f(1, x), so we can prove opening 1 directly:
-        let (g_r_sumcheck, chis_r) =
-            MultilinearPolynomial::batch_evaluate(&[&g_polynomial], &r_sumcheck);
+        let g_r_sumcheck = MultilinearPolynomial::batch_evaluate(&[&g_polynomial], &r_sumcheck);
+        // NOTE, we have to recompute chis_r here due to the change in interface of batch_evaluate
+        let chis_r = EqPolynomial::evals(&r_sumcheck);
         opening_accumulator.append_dense(
             &[&g_polynomial],
             chis_r,
