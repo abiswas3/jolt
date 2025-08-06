@@ -5,7 +5,7 @@ use crate::poly::multilinear_polynomial::PolynomialEvaluation;
 use crate::utils::thread::unsafe_allocate_zero_vec;
 use crate::utils::{self, compute_dotproduct, compute_dotproduct_low_optimized};
 
-use crate::field::JoltField;
+use crate::field::{JoltField, OptimizedMul};
 use crate::utils::math::Math;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use core::ops::Index;
@@ -243,7 +243,8 @@ impl<F: JoltField> DensePolynomial<F> {
     }
 
     // returns Z(r) in O(n) time
-    pub fn evaluate(&self, r: &[F]) -> F {
+    // This is the old dot product polynomial evaluation
+    pub fn evaluate_with_dot_product(&self, r: &[F]) -> F {
         // r must have a value for each variable
         assert_eq!(r.len(), self.get_num_vars());
         let chis = EqPolynomial::evals(r);
@@ -251,37 +252,104 @@ impl<F: JoltField> DensePolynomial<F> {
         compute_dotproduct(&self.Z, &chis)
     }
 
+    pub fn single_sparse_polynomial_evalutation(&self, r: &[F]) -> F {
+        const PARALLEL_THRESHOLD: usize = 16;
+        let m = r.len();
+        // r must have a value for each variable
+        assert_eq!(m, self.get_num_vars());
+        if m < PARALLEL_THRESHOLD {
+            self.single_sparse_polynomial_evalutation_serial(r)
+        } else {
+            self.single_sparse_polynomial_evalutation_parallel(r)
+        }
+    }
+
+    fn single_sparse_polynomial_evalutation_parallel(&self, r: &[F]) -> F {
+        let m = r.len() / 2;
+        let (r2, r1) = r.split_at(m);
+        let (eq_one, eq_two) = rayon::join(|| EqPolynomial::evals(r2), || EqPolynomial::evals(r1));
+        let eval: F = (0..eq_one.len())
+            .flat_map(|x1| (0..eq_two.len()).map(move |x2| (x1, x2)))
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|(x1, x2)| {
+                let idx = x1 * eq_two.len() + x2;
+                if self.Z[idx].is_zero() || eq_one[x1].is_zero() || eq_two[x2].is_zero() {
+                    F::zero()
+                } else {
+                    let coef = OptimizedMul::mul_01_optimized(self.Z[idx], eq_two[x2]);
+                    OptimizedMul::mul_01_optimized(eq_one[x1], coef)
+                }
+            })
+            .reduce(|| F::zero(), |acc, v| acc + v);
+
+        eval
+    }
+    fn single_sparse_polynomial_evalutation_serial(&self, r: &[F]) -> F {
+        let m = r.len() / 2;
+        let (r2, r1) = r.split_at(m);
+        let (eq_one, eq_two) = rayon::join(|| EqPolynomial::evals(r2), || EqPolynomial::evals(r1));
+        let eval: F = (0..eq_one.len())
+            .flat_map(|x1| (0..eq_two.len()).map(move |x2| (x1, x2)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|(x1, x2)| {
+                let idx = x1 * eq_two.len() + x2;
+                if self.Z[idx].is_zero() || eq_one[x1].is_zero() || eq_two[x2].is_zero() {
+                    F::zero()
+                } else {
+                    let coef = OptimizedMul::mul_01_optimized(self.Z[idx], eq_two[x2]);
+                    OptimizedMul::mul_01_optimized(eq_one[x1], coef)
+                }
+            })
+            .fold(F::zero(), |acc, v| acc + v);
+
+        eval
+    }
+
     // Faster evaluation based on
     // https://randomwalks.xyz/publish/fast_polynomial_evaluation.html
-    // Shaves a factor of 2 from run time.
-    pub fn optimised_evaluate(&self, r: &[F]) -> F {
-        // Copied over from eq_poly
+    // Shaves a factor of 2 from run time by not computing dot product
+    pub fn evaluate(&self, r: &[F]) -> F {
+        // From prior experimation (see EqPolynomiall::evals)
         // If the number of variables are greater
         // than 2^16 -- use parallel evaluate
         // Below that it's better to just do things linearly.
         const PARALLEL_THRESHOLD: usize = 16;
 
-        // r must have a value for each variable
-        assert_eq!(r.len(), self.get_num_vars());
         let m = r.len();
+        // r must have a value for each variable
+        assert_eq!(m, self.get_num_vars());
         if m < PARALLEL_THRESHOLD {
-            self.evaluate_optimised_serial(r)
+            self.inside_out_serial(r)
         } else {
-            self.evaluate_optimised_parallel(r)
+            self.inside_out_parallel(r)
         }
     }
 
-    fn evaluate_optimised_serial(&self, r: &[F]) -> F {
+    fn inside_out_serial(&self, r: &[F]) -> F {
+        // r is expected to be big endinan
+        // r[0] is the most significant digit
         let mut current = self.Z.clone();
-
         let m = r.len();
         for i in (0..m).rev() {
             let stride = 1 << i;
 
+            // Note that as r is big endian
+            // and i is reversed
+            // r[m-1-i] actually starts at the big endian digit
+            // and moves towards the little endian digit.
             for j in 0..stride {
                 let f0 = current[j];
                 let f1 = current[j + stride];
-                current[j] = f0 + r[m - 1 - i] * (f1 - f0);
+                let slope = f1 - f0;
+                if slope.is_zero() {
+                    current[j] = f0;
+                } else if slope.is_one() {
+                    current[j] = f0 + r[m - 1 - i];
+                } else {
+                    current[j] = f0 + r[m - 1 - i] * slope;
+                }
             }
             // No benefit to truncating really.
             //current.truncate(stride);
@@ -289,7 +357,7 @@ impl<F: JoltField> DensePolynomial<F> {
         current[0]
     }
 
-    fn evaluate_optimised_parallel(&self, r: &[F]) -> F {
+    fn inside_out_parallel(&self, r: &[F]) -> F {
         let mut current: Vec<_> = self.Z.par_iter().cloned().collect();
         let m = r.len();
         // Invoking the same parallelisation structure
@@ -305,7 +373,15 @@ impl<F: JoltField> DensePolynomial<F> {
                 .par_iter_mut()
                 .zip(evals_right.par_iter())
                 .for_each(|(x, y)| {
-                    *x = *x + r_val * (*y - *x);
+                    let slope = *y - *x;
+                    if slope.is_zero() {
+                        return;
+                    }
+                    if slope.is_one() {
+                        *x += r_val;
+                    } else {
+                        *x += r_val * slope;
+                    }
                 });
         }
         current[0]
@@ -313,6 +389,42 @@ impl<F: JoltField> DensePolynomial<F> {
 
     pub fn evaluate_at_chi(&self, chis: &[F]) -> F {
         compute_dotproduct(&self.Z, chis)
+    }
+
+    pub fn evaluate_at_chi_split_eq(&self, eq_one: &[F], eq_two: &[F]) -> F {
+        if eq_one.len().log_2() + eq_two.len().log_2() < 16 {
+            let eval: F = (0..eq_one.len())
+                .flat_map(|x1| (0..eq_two.len()).map(move |x2| (x1, x2)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|(x1, x2)| {
+                    let idx = x1 * eq_two.len() + x2;
+                    if self.Z[idx].is_zero() || eq_one[x1].is_zero() || eq_two[x2].is_zero() {
+                        F::zero()
+                    } else {
+                        let coef = OptimizedMul::mul_01_optimized(self.Z[idx], eq_two[x2]);
+                        OptimizedMul::mul_01_optimized(eq_one[x1], coef)
+                    }
+                })
+                .fold(F::zero(), |acc, v| acc + v);
+            eval
+        } else {
+            let eval: F = (0..eq_one.len())
+                .flat_map(|x1| (0..eq_two.len()).map(move |x2| (x1, x2)))
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|(x1, x2)| {
+                    let idx = x1 * eq_two.len() + x2;
+                    if self.Z[idx].is_zero() || eq_one[x1].is_zero() || eq_two[x2].is_zero() {
+                        F::zero()
+                    } else {
+                        let coef = OptimizedMul::mul_01_optimized(self.Z[idx], eq_two[x2]);
+                        OptimizedMul::mul_01_optimized(eq_one[x1], coef)
+                    }
+                })
+                .reduce(|| F::zero(), |acc, v| acc + v);
+            eval
+        }
     }
 
     pub fn evaluate_at_chi_low_optimized(&self, chis: &[F]) -> F {
@@ -501,8 +613,8 @@ mod tests {
             for _ in 0..10 {
                 let eval_point: Vec<Fr> = (0..num_vars).map(|_| Fr::random(&mut rng)).collect();
 
-                let eval1 = poly.evaluate(&eval_point);
-                let eval2 = poly.optimised_evaluate(&eval_point);
+                let eval1 = poly.evaluate_with_dot_product(&eval_point);
+                let eval2 = poly.evaluate(&eval_point);
 
                 assert_eq!(
                     eval1, eval2,
@@ -532,7 +644,7 @@ mod tests {
         // g(3, 4) = 8*(1 - 3)(1 - 4) + 8*(1-3)(4) + 8*(3)(1-4) + 8*(3)(4) = 48 + -64 + -72 + 96  = 8
         // g(5, 10) = 8*(1 - 5)(1 - 10) + 8*(1 - 5)(10) + 8*(5)(1-10) + 8*(5)(10) = 96 + -16 + -72 + 96  = 8
         assert_eq!(
-            dense_poly.optimised_evaluate(vec![Fr::from(3), Fr::from(4)].as_slice()),
+            dense_poly.evaluate(vec![Fr::from(3), Fr::from(4)].as_slice()),
             Fr::from(8)
         );
     }

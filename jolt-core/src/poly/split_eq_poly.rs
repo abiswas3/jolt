@@ -311,7 +311,13 @@ impl<F: JoltField> SplitEqPolynomial<F> {
             self.E1_len * self.E2_len
         }
     }
+    pub fn get_outside_eq(&self) -> &[F] {
+        &self.E1
+    }
 
+    pub fn get_inside_eq(&self) -> &[F] {
+        &self.E2
+    }
     #[tracing::instrument(skip_all, name = "SplitEqPolynomial::bind")]
     pub fn bind(&mut self, r: F) {
         if self.E1_len == 1 {

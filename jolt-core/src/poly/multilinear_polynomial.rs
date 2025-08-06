@@ -1,5 +1,8 @@
 use crate::{
-    poly::{one_hot_polynomial::OneHotPolynomial, rlc_polynomial::RLCPolynomial},
+    poly::{
+        one_hot_polynomial::OneHotPolynomial, rlc_polynomial::RLCPolynomial,
+        split_eq_poly::SplitEqPolynomial,
+    },
     utils::{compute_dotproduct, math::Math},
 };
 use num_traits::MulAdd;
@@ -305,7 +308,30 @@ impl<F: JoltField> MultilinearPolynomial<F> {
     // This might be eventually removed from the code base
     pub fn evaluate_dot_product(&self, r: &[F]) -> F {
         match self {
-            MultilinearPolynomial::LargeScalars(poly) => poly.evaluate(r),
+            MultilinearPolynomial::LargeScalars(poly) => poly.evaluate_with_dot_product(r),
+            MultilinearPolynomial::RLC(_) => {
+                // TODO(moodlezoup): This case is only hit in the Dory opening proof,
+                // which doesn't actually do anything with this value. We should
+                // remove that call from Dory.
+                F::zero()
+            }
+            _ => {
+                let chis = EqPolynomial::evals(r);
+                self.dot_product(&chis)
+            }
+        }
+    }
+
+    pub fn evaluate_sparse_dot_product(&self, r: &[F]) -> F {
+        match self {
+            MultilinearPolynomial::LargeScalars(poly) => {
+                poly.single_sparse_polynomial_evalutation(r)
+            }
+            MultilinearPolynomial::U8Scalars(poly) => poly.split_eq_evaluate(r),
+            MultilinearPolynomial::U16Scalars(poly) => poly.split_eq_evaluate(r),
+            MultilinearPolynomial::U32Scalars(poly) => poly.split_eq_evaluate(r),
+            MultilinearPolynomial::U64Scalars(poly) => poly.split_eq_evaluate(r),
+            MultilinearPolynomial::I64Scalars(poly) => poly.split_eq_evaluate(r),
             MultilinearPolynomial::RLC(_) => {
                 // TODO(moodlezoup): This case is only hit in the Dory opening proof,
                 // which doesn't actually do anything with this value. We should
@@ -503,9 +529,7 @@ pub trait PolynomialBinding<F: JoltField> {
 }
 
 pub trait PolynomialEvaluation<F: JoltField> {
-    /// Returns the final sumcheck claim about the polynomial.
-    /// This uses the algorithm in Lemma 4.3 in Thaler, Proofs and
-    /// Arguments -- the inside out processing
+    // Evaluate polynomial at r
     fn evaluate(&self, r: &[F]) -> F;
 
     /// Evaluates a batch of polynomials on the same point `r`.
@@ -575,16 +599,61 @@ impl<F: JoltField> PolynomialBinding<F> for MultilinearPolynomial<F> {
     }
 }
 
+// TODO: Batch Evaluate : Eventually move dot product here
+impl<F: JoltField> MultilinearPolynomial<F> {
+    #[tracing::instrument(skip_all, name = "MultilinearPolynomial::batch_evaluate_sparse")]
+    pub fn batch_evaluate_optimised_for_sparse_polynomials(
+        polys: &[&Self],
+        r: &[F],
+    ) -> (Vec<F>, Vec<F>) {
+        let greq = SplitEqPolynomial::new(r);
+        let eq_two = greq.get_inside_eq();
+        let eq_one = greq.get_outside_eq();
+        let evals: Vec<F> = polys
+            .into_par_iter()
+            .map(|&poly| match poly {
+                MultilinearPolynomial::LargeScalars(poly) => {
+                    poly.evaluate_at_chi_split_eq(eq_one, eq_two)
+                }
+                _ => {
+                    let eq = EqPolynomial::evals(r);
+                    poly.dot_product(&eq)
+                }
+            })
+            .collect();
+        (evals, eq_one.to_vec())
+    }
+    #[tracing::instrument(skip_all, name = "MultilinearPolynomial::batch_evaluate_inside_out")]
+    pub fn batch_evaluate_inside_out(
+        //todo
+        polys: &[&Self],
+        r: &[F],
+    ) -> (Vec<F>, Vec<F>) {
+        let eq = EqPolynomial::evals(r);
+        let evals: Vec<F> = polys
+            .into_par_iter()
+            .map(|&poly| match poly {
+                MultilinearPolynomial::LargeScalars(poly) => {
+                    poly.evaluate_at_chi_low_optimized(&eq)
+                }
+                _ => poly.dot_product(&eq),
+            })
+            .collect();
+        (evals, eq)
+    }
+}
+
+// Currently it's set to inside out
 impl<F: JoltField> PolynomialEvaluation<F> for MultilinearPolynomial<F> {
     #[tracing::instrument(skip_all, name = "MultilinearPolynomial::evaluate")]
     fn evaluate(&self, r: &[F]) -> F {
         match self {
-            MultilinearPolynomial::LargeScalars(poly) => poly.optimised_evaluate(r),
-            MultilinearPolynomial::U8Scalars(poly) => poly.optimised_evaluate(r),
-            MultilinearPolynomial::U16Scalars(poly) => poly.optimised_evaluate(r),
-            MultilinearPolynomial::U32Scalars(poly) => poly.optimised_evaluate(r),
-            MultilinearPolynomial::U64Scalars(poly) => poly.optimised_evaluate(r),
-            MultilinearPolynomial::I64Scalars(poly) => poly.optimised_evaluate(r),
+            MultilinearPolynomial::LargeScalars(poly) => poly.evaluate(r),
+            MultilinearPolynomial::U8Scalars(poly) => poly.evaluate(r),
+            MultilinearPolynomial::U16Scalars(poly) => poly.evaluate(r),
+            MultilinearPolynomial::U32Scalars(poly) => poly.evaluate(r),
+            MultilinearPolynomial::U64Scalars(poly) => poly.evaluate(r),
+            MultilinearPolynomial::I64Scalars(poly) => poly.evaluate(r),
             MultilinearPolynomial::RLC(_) => F::zero(),
             _ => {
                 let chis = EqPolynomial::evals(r);
@@ -595,6 +664,7 @@ impl<F: JoltField> PolynomialEvaluation<F> for MultilinearPolynomial<F> {
 
     #[tracing::instrument(skip_all, name = "MultilinearPolynomial::batch_evaluate")]
     fn batch_evaluate(polys: &[&Self], r: &[F]) -> (Vec<F>, Vec<F>) {
+        assert!(!r.is_empty());
         let eq = EqPolynomial::evals(r);
         let evals: Vec<F> = polys
             .into_par_iter()

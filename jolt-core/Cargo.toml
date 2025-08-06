@@ -143,6 +143,11 @@ name = "compact_poly_bench"
 harness= false
 
 [[bench]]
+name = "sumcheck_micro_benches"
+harness= false
+
+
+[[bench]]
 name = "shout_e2e"
 harness= false
 

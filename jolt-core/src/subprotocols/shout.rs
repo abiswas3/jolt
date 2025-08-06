@@ -18,23 +18,6 @@ use crate::{
     },
 };
 use rayon::prelude::*;
-use std::time::Instant;
-
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-// Global counter
-static MULT_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
-pub struct CountingField<F: JoltField>(pub F);
-impl<F: JoltField> CountingField<F> {
-    pub fn reset_count() {
-        MULT_COUNT.store(0, Ordering::Relaxed);
-    }
-    pub fn mult_count() -> usize {
-        MULT_COUNT.load(Ordering::Relaxed)
-    }
-}
 
 pub struct ShoutProof<F: JoltField, ProofTranscript: Transcript> {
     sumcheck_proof: SumcheckInstanceProof<F, ProofTranscript>,
@@ -342,31 +325,11 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
     let E_star: Vec<F> = EqPolynomial::evals(&r_cycle);
     // Page 50: eq(47) : what the paper calls v_k
 
-    // TODO: Speed this up
-    let C: Vec<_> = (0..K) // This is C[x] = ra(r_cycle, x)
-        .into_par_iter()
-        .map(|k| {
-            read_addresses
-                .iter()
-                .enumerate()
-                .filter_map(|(cycle, address)| {
-                    if *address == k {
-                        // this check will be more complex for d > 1 but let's keep
-                        // this for now
-                        Some(E_star[cycle])
-                    } else {
-                        None
-                    }
-                })
-                .sum::<F>()
-        })
-        .collect();
-
+    let C = construct_vector_c_in_shout(K, &read_addresses, &E_star);
     let num_rounds = K.log_2() + T.log_2();
     // The vector storing the verifiers sum-check challenges
     let mut r_address: Vec<F> = Vec::with_capacity(num_rounds);
 
-    // The sum check answer (for d=1, it's the same as normal one)
     let sumcheck_claim: F = C
         .par_iter()
         .zip(lookup_table.par_iter())
@@ -427,6 +390,7 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
     // Filling out E involve any multiplications (Just lookups)
 
     // d is never very large : no need to parallelise over d
+    // ENDIAN STUFF -- this because extact last digits first so E[j] updates is being mapped to eq_taus[d-j-1]
     for (j, e_j) in Es.iter_mut().rev().enumerate() {
         // each e_j has T slots and T is large so this should be parallel
         e_j.par_iter_mut().enumerate().for_each(|(y, e)| {
@@ -434,8 +398,6 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
             *e = eq_taus[d - j - 1][addr_j];
         });
     }
-    //Es.reverse();
-    // ENDIAN STUFF -- this because extact last digits first so E[j] updates is being mapped to eq_taus[d-j-1]
 
     // The E tables will be dropped once we make ra_taus
     // d is small : no need to parallelise
@@ -443,14 +405,18 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
         Es.into_iter().map(MultilinearPolynomial::from).collect();
 
     // Making E_star into a SplitEqPoly
+    // The 2 EqPolynomials here should not be parellelised
+    // as they start with size \sqrt{T} which is below 16
+    // which is the parallel threshold as max T = 2**32
     let mut greq_r_cycle = GruenSplitEqPolynomial::new(&r_cycle);
 
+    // This how many evals we need to evaluate t(x)
+    // The degree of t is d
     let degree = d + 1;
     for _time_round_idx in 0..T.log_2() {
         let E_2 = greq_r_cycle.E_in_current();
         let E_1 = greq_r_cycle.E_out_current();
 
-        // It T = 2^32 each E_1, E_2 is roughly 2^16
         // so we only want to parallelise over inner loop
         let mut evals_of_t: Vec<F> = (0..E_1.len())
             .flat_map(|x1| (0..E_2.len()).map(move |x2| (x1, x2)))
@@ -459,13 +425,19 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
             .map(|(x1, x2)| {
                 let idx = x1 * E_2.len() + x2;
 
-                // Compute all ra_tau evaluations for this (x1, x2)
+                // Compute all ra_tau evaluations for this (x1 || x2)
+                // There are only d of this and d is a small constant
+                // no parallelisation
+                // d x degree : matrix
                 let ra_evals_per_tau: Vec<Vec<F>> = ra_taus
                     .iter()
                     .map(|ra_tau| ra_tau.sumcheck_evals(idx, degree, BindingOrder::LowToHigh))
                     .collect();
 
                 // Compute product across ra_taus for each degree position
+                // column wise produce
+                // to get \prod_{i=1}^d ra_i(r_cycle, r_1, ..., r_{i-1}, c, x1||x2)
+                // for c in {0, 2, ..., d+1}
                 let eval: Vec<F> = (0..degree)
                     .map(|i| {
                         ra_evals_per_tau
@@ -481,6 +453,7 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
                 eval.into_iter().map(|e| coeff * e).collect::<Vec<F>>()
             })
             .reduce(
+                // sum over all x1||x2
                 || vec![F::zero(); degree],
                 |mut acc, v| {
                     for (a, b) in acc.iter_mut().zip(v) {
@@ -490,49 +463,12 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
                 },
             );
 
-        //let mut evals_of_t: Vec<F> = (0..E_1.len())
-        //    .map(|x1| {
-        //        let inner_sum: Vec<F> = (0..E_2.len())
-        //            .into_par_iter()
-        //            .map(|x2| {
-        //                let idx = x1 * E_2.len() + x2;
-        //
-        //                let ra_evals_per_tau: Vec<Vec<F>> = ra_taus
-        //                    .iter()
-        //                    .map(|ra_tau| {
-        //                        ra_tau.sumcheck_evals(idx, degree, BindingOrder::LowToHigh)
-        //                    })
-        //                    .collect();
-        //
-        //                let eval: Vec<F> = (0..degree)
-        //                    .map(|i| {
-        //                        ra_evals_per_tau
-        //                            .par_iter()
-        //                            .map(|row| row[i])
-        //                            .reduce(|| F::one(), |a, b| a * b)
-        //                    })
-        //                    .collect();
-        //
-        //                eval.iter().map(|e| E_2[x2] * *e).collect::<Vec<F>>()
-        //            })
-        //            .reduce_with(|a, b| a.iter().zip(&b).map(|(x, y)| *x + *y).collect())
-        //            .unwrap_or_else(|| vec![F::zero(); degree]);
-        //
-        //        inner_sum
-        //            .into_iter()
-        //            .map(|val| val * E_1[x1])
-        //            .collect::<Vec<F>>()
-        //    })
-        //    .reduce(|a, b| a.iter().zip(&b).map(|(x, y)| *x + *y).collect())
-        //    .unwrap_or_else(|| vec![F::zero(); degree]);
-
         let ell_at_0 = val_claim
             * greq_r_cycle.get_current_scalar()
             * (F::one() - greq_r_cycle.get_current_w());
         let ell_at_1 = val_claim * greq_r_cycle.get_current_scalar() * greq_r_cycle.get_current_w();
-        //let ell_x = UniPoly::from_evals(&[ell_at_0, ell_at_1]);
 
-        // ell is linear
+        // ell is linear: so do interpolation, don't use multiplication
         let mut d_plus_three_evaluations_of_ell: Vec<F> = vec![F::zero(); d + 3];
         d_plus_three_evaluations_of_ell[0] = ell_at_0;
         let m = ell_at_1 - ell_at_0;
@@ -542,16 +478,19 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
             eval += m;
         }
 
+        // Procedure 8 from Dao/Thaler/Domb/Baggad
         let ell_one_inverse = ell_at_1
             .inverse()
             .expect("Tried to invert zero (ell_at_1 has no inverse)");
 
         let t_at_zero = evals_of_t[0];
         let t_at_one = ell_one_inverse * (previous_claim - t_at_zero * ell_at_0);
-
         evals_of_t.insert(1, t_at_one);
+
         // d + 2 evaluations of t are sufficient to construct the polynomial
         let t_x = UniPoly::from_evals(&evals_of_t);
+        //We need this to evaluate t @ d+2 which we don't hae right now
+        // but this will only take d mults instead of 2^{\log T - round_i}
 
         let d_plus_three_evaluations: Vec<F> = (0..(d + 3))
             .map(|i| {
@@ -634,25 +573,7 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one<
     // Page 50: eq(44)
     let E_star: Vec<F> = EqPolynomial::evals(&r_cycle);
     // Page 50: eq(47) : what the paper calls v_k
-    let C: Vec<_> = (0..K) // This is C[x] = ra(r_cycle, x)
-        .into_par_iter()
-        .map(|k| {
-            read_addresses
-                .iter()
-                .enumerate()
-                .filter_map(|(cycle, address)| {
-                    if *address == k {
-                        // this check will be more complex for d > 1 but let's keep
-                        // this for now
-                        Some(E_star[cycle])
-                    } else {
-                        None
-                    }
-                })
-                .sum::<F>()
-        })
-        .collect();
-
+    let C = construct_vector_c_in_shout(K, &read_addresses, &E_star);
     let num_rounds = K.log_2() + T.log_2();
     // The vector storing the verifiers sum-check challenges
     let mut r_address: Vec<F> = Vec::with_capacity(num_rounds);
@@ -671,6 +592,7 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one<
     let mut val = MultilinearPolynomial::from(lookup_table);
 
     // Binding the first log_2 K variables
+    // How many evaluations we need
     const DEGREE_ADDR: usize = 2;
     let mut compressed_polys: Vec<CompressedUniPoly<F>> = Vec::with_capacity(num_rounds);
     for _addr_idx in 0..K.log_2() {
@@ -725,6 +647,7 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one<
     // Filling out E involve any multiplications
     // Just lookups
     // iterate of each table e_j in parallel
+    // TODO: check if this should be double parallel
     E.par_iter_mut().enumerate().for_each(|(j, e_j)| {
         // for a fixed table e_j iterate through all of time stamps
         e_j.par_iter_mut().enumerate().for_each(|(y, e)| {
@@ -737,7 +660,6 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one<
             *e = eq_taus[d - j - 1][addr_j];
         });
     });
-    // FIX later -- this because extact last digits first so E[j] updates is being mapped to eq_taus[d-j-1]
     E.reverse();
     // The E tables will be dropped once we make ra_taus
     let mut ra_taus: Vec<MultilinearPolynomial<F>> =
@@ -909,7 +831,7 @@ fn compute_eq_taus_serial<F: JoltField>(
 }
 
 /// Extracts the `j`-th digit (0-indexed from the most significant digit) of `addr`
-/// when written in base `base`, assuming the total number of digits is `d`.
+/// when written in base `base (N=K^{1/d})`, assuming the total number of digits is `d`.
 ///
 /// # Arguments
 ///
@@ -942,6 +864,36 @@ fn digit_j_of(addr: usize, j: usize, d: usize, base: usize) -> usize {
     (addr / base.pow(exp as u32)) % base
 }
 
+fn construct_vector_c_in_shout<F: JoltField>(
+    table_size: usize,
+    read_addresses: &Vec<usize>,
+    e_star: &Vec<F>,
+) -> Vec<F> {
+    let c = read_addresses
+        .par_iter()
+        .zip(e_star.par_iter())
+        .fold(
+            || vec![F::zero(); table_size],
+            |mut acc, (&address, &val)| {
+                if address < table_size {
+                    acc[address] += val;
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![F::zero(); table_size],
+            |mut a, b| {
+                for (ai, bi) in a.iter_mut().zip(b) {
+                    *ai += bi;
+                }
+                a
+            },
+        );
+
+    c
+}
+
 /// Implements the sumcheck prover for the generic core Shout PIOP for d=1.
 /// With Gruen And Split Poly Opts Included
 /// See Figure 7 of https://eprint.iacr.org/2025/105
@@ -969,24 +921,9 @@ pub fn prove_generic_core_shout_piop_d_is_one_w_gruen<F: JoltField, ProofTranscr
     // Page 50: eq(47) : what the paper calls v_k
 
     // This is sub-optimal -> TODO
-    let C: Vec<_> = (0..K) // This is C[x] = ra(r_cycle, x)
-        .into_par_iter()
-        .map(|k| {
-            read_addresses
-                .iter()
-                .enumerate()
-                .filter_map(|(cycle, address)| {
-                    if *address == k {
-                        // this check will be more complex for d > 1 but let's keep
-                        // this for now
-                        Some(E_star[cycle])
-                    } else {
-                        None
-                    }
-                })
-                .sum::<F>()
-        })
-        .collect();
+    // read_addresses is much bigger
+    // so this a thing to check
+    let C = construct_vector_c_in_shout(K, &read_addresses, &E_star);
 
     // The sum check answer.
     // Note that it does not matter whether d=1 or d > 1

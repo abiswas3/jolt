@@ -1,14 +1,15 @@
 use ark_bn254::Fr;
 use ark_ff::UniformRand;
 use ark_std::rand::{rngs::StdRng, SeedableRng};
+//use jolt_core::field::tracked_ark::TrackedFr as Fr;
 use jolt_core::subprotocols::shout::{
     prove_generic_core_shout_piop_d_is_one_w_gruen, prove_generic_core_shout_pip,
 };
+use jolt_core::utils::counters::{get_mult_count, reset_mult_count};
 use jolt_core::utils::transcript::KeccakTranscript;
 use jolt_core::utils::transcript::Transcript;
 use rand_core::RngCore;
 use std::time::Instant;
-
 fn main() {
     // ------- PROBLEM SETUP ----------------------
     const K: usize = 64;
@@ -65,4 +66,7 @@ fn main() {
         val_tau_claim,
         duration.as_millis()
     );
+    println!("How many multiplications: {}", get_mult_count());
+    reset_mult_count();
+    println!("How many multiplications: {}", get_mult_count());
 }

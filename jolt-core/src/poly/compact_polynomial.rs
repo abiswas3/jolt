@@ -1,6 +1,5 @@
-use std::ops::Index;
-
 use super::multilinear_polynomial::{BindingOrder, PolynomialBinding};
+use crate::poly::eq_poly::EqPolynomial;
 use crate::utils::math::Math;
 use crate::utils::thread::unsafe_allocate_zero_vec;
 use crate::{field::JoltField, utils};
@@ -8,6 +7,7 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use num_integer::Integer;
 use rayon::prelude::*;
 use std::cmp::Ordering;
+use std::ops::Index;
 
 /// A trait for small scalars ({u/i}{8/16/32/64})
 pub trait SmallScalar: Copy + Integer + Sync + CanonicalSerialize + CanonicalDeserialize {
@@ -128,6 +128,10 @@ impl<T: SmallScalar, F: JoltField> CompactPolynomial<T, F> {
         }
     }
 
+    pub fn evaluate(&self, r: &[F]) -> F {
+        self.inside_out_evaluate(r)
+    }
+
     pub fn get_num_vars(&self) -> usize {
         self.num_vars
     }
@@ -147,10 +151,76 @@ impl<T: SmallScalar, F: JoltField> CompactPolynomial<T, F> {
     pub fn coeffs_as_field_elements(&self) -> Vec<F> {
         self.coeffs.par_iter().map(|x| x.to_field()).collect()
     }
+
+    pub fn split_eq_evaluate(&self, r: &[F]) -> F {
+        const PARALLEL_THRESHOLD: usize = 16;
+        // r must have a value for each variable
+        assert_eq!(r.len(), self.get_num_vars());
+        let m = r.len();
+        if m < PARALLEL_THRESHOLD {
+            self.evaluate_split_eq_serial(r)
+        } else {
+            self.evaluate_split_eq_parallel(r)
+        }
+    }
+
+    fn evaluate_split_eq_parallel(&self, r: &[F]) -> F {
+        let m = r.len() / 2;
+        let (r2, r1) = r.split_at(m);
+        let (eq_one, eq_two) = rayon::join(|| EqPolynomial::evals(r2), || EqPolynomial::evals(r1));
+        let eval: F = (0..eq_one.len())
+            .flat_map(|x1| (0..eq_two.len()).map(move |x2| (x1, x2)))
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|(x1, x2)| {
+                let idx = x1 * eq_two.len() + x2;
+                if self.coeffs[idx].is_zero() || eq_one[x1].is_zero() || eq_two[x2].is_zero() {
+                    F::zero()
+                } else if eq_two[x2].is_one() && eq_one[x1].is_one() {
+                    self.coeffs[idx].to_field()
+                } else if eq_one[x1].is_one() {
+                    self.coeffs[idx].field_mul(eq_two[x2])
+                } else if eq_two[x2].is_one() {
+                    self.coeffs[idx].field_mul(eq_one[x1])
+                } else {
+                    self.coeffs[idx].field_mul(eq_one[x1]) * eq_two[x2]
+                }
+            })
+            .reduce(|| F::zero(), |acc, v| acc + v);
+
+        eval
+    }
+    fn evaluate_split_eq_serial(&self, r: &[F]) -> F {
+        let m = r.len() / 2;
+        let (r2, r1) = r.split_at(m);
+        let (eq_one, eq_two) = rayon::join(|| EqPolynomial::evals(r2), || EqPolynomial::evals(r1));
+        let eval: F = (0..eq_one.len())
+            .flat_map(|x1| (0..eq_two.len()).map(move |x2| (x1, x2)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|(x1, x2)| {
+                let idx = x1 * eq_two.len() + x2;
+                if self.coeffs[idx].is_zero() || eq_one[x1].is_zero() || eq_two[x2].is_zero() {
+                    F::zero()
+                } else if eq_two[x2].is_one() && eq_one[x1].is_one() {
+                    self.coeffs[idx].to_field()
+                } else if eq_one[x1].is_one() {
+                    self.coeffs[idx].field_mul(eq_two[x2])
+                } else if eq_two[x2].is_one() {
+                    self.coeffs[idx].field_mul(eq_one[x1])
+                } else {
+                    self.coeffs[idx].field_mul(eq_one[x1]) * eq_two[x2]
+                }
+            })
+            .fold(F::zero(), |acc, v| acc + v);
+
+        eval
+    }
+
     // Faster evaluation based on
     // https://randomwalks.xyz/publish/fast_polynomial_evaluation.html
     // Shaves a factor of 2 from run time.
-    pub fn optimised_evaluate(&self, r: &[F]) -> F {
+    pub fn inside_out_evaluate(&self, r: &[F]) -> F {
         // Copied over from eq_poly
         // If the number of variables are greater
         // than 2^16 -- use parallel evaluate
@@ -160,13 +230,14 @@ impl<T: SmallScalar, F: JoltField> CompactPolynomial<T, F> {
         assert_eq!(r.len(), self.get_num_vars());
         let m = r.len();
         if m < PARALLEL_THRESHOLD {
-            self.evaluate_optimised_serial(r)
+            self.inside_out_serial(r)
         } else {
-            self.evaluate_optimised_parallel(r)
+            self.inside_out_parallel(r)
         }
     }
 
-    fn evaluate_optimised_serial(&self, r: &[F]) -> F {
+    fn inside_out_serial(&self, r: &[F]) -> F {
+        // coeffs is a vector small scalars
         let mut current: Vec<F> = self.coeffs.iter().map(|&c| c.to_field()).collect();
         let m = r.len();
         for i in (0..m).rev() {
@@ -175,12 +246,21 @@ impl<T: SmallScalar, F: JoltField> CompactPolynomial<T, F> {
             for j in 0..stride {
                 let f0 = current[j];
                 let f1 = current[j + stride];
-                current[j] = f0 + (f1 - f0) * (r_val);
+                let slope = f1 - f0;
+                if slope.is_zero() {
+                    current[j] = f0;
+                }
+                if slope.is_one() {
+                    current[j] = f0 + r_val;
+                } else {
+                    current[j] = f0 + slope * (r_val);
+                }
             }
         }
         current[0]
     }
-    fn evaluate_optimised_parallel(&self, r: &[F]) -> F {
+
+    fn inside_out_parallel(&self, r: &[F]) -> F {
         let mut current: Vec<F> = self.coeffs.par_iter().map(|&c| c.to_field()).collect();
         let m = r.len();
         for i in (0..m).rev() {
@@ -193,7 +273,16 @@ impl<T: SmallScalar, F: JoltField> CompactPolynomial<T, F> {
                 .par_iter_mut()
                 .zip(evals_right.par_iter())
                 .for_each(|(x, y)| {
-                    *x = *x + r_val * (*y - *x);
+                    //*x = *x + r_val * (*y - *x);
+                    let slope = *y - *x;
+                    if slope.is_zero() {
+                        return;
+                    }
+                    if slope.is_one() {
+                        *x += r_val;
+                    } else {
+                        *x += r_val * slope;
+                    }
                 });
         }
         current[0]

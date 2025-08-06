@@ -4,6 +4,7 @@ use crate::field::JoltField;
 use ark_std::test_rng;
 use rayon::prelude::*;
 
+pub mod counters;
 pub mod errors;
 pub mod gaussian_elimination;
 pub mod math;
@@ -12,7 +13,6 @@ pub mod small_value;
 pub mod sol_types;
 pub mod thread;
 pub mod transcript;
-
 /// Macros that determine the optimal iterator type based on the feature flags.
 ///
 /// For some cases (ex. offloading to GPU), we may not want to use a parallel iterator.
