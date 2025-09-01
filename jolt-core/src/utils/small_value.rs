@@ -1274,7 +1274,7 @@ pub mod svo_helpers {
     >(
         accums_zero: &[F],
         accums_infty: &[F],
-        r_challenges: &mut Vec<F>,
+        r_challenges: &mut Vec<u128>,
         round_polys: &mut Vec<CompressedUniPoly<F>>,
         claim: &mut F,
         transcript: &mut ProofTranscript,
@@ -1356,7 +1356,11 @@ pub mod svo_helpers {
                 transcript,
             );
 
-            let lagrange_coeffs_r_i = [F::one() - r_i, r_i, r_i * (r_i - F::one())];
+            let lagrange_coeffs_r_i = [
+                F::one() - F::from_u128(r_i),
+                F::from_u128(r_i),
+                (F::from_u128(r_i) - F::one()).mul_u128_mont_form(r_i),
+            ];
 
             if i < NUM_SVO_ROUNDS.saturating_sub(1) {
                 lagrange_coeffs = lagrange_coeffs_r_i

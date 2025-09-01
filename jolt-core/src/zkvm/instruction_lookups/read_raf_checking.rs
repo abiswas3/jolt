@@ -59,8 +59,8 @@ pub fn current_suffix_len(log_K: usize, j: usize) -> usize {
 struct ReadRafProverState<F: JoltField> {
     ra_acc: Option<Vec<F>>,
     ra: Option<MultilinearPolynomial<F>>,
-    r: Vec<F>,
-
+    #[allocative(skip)]
+    r: Vec<u128>,
     lookup_indices: Vec<LookupBits>,
     lookup_indices_by_table: Vec<Vec<(usize, LookupBits)>>,
     lookup_indices_uninterleave: Vec<(usize, LookupBits)>,
@@ -88,8 +88,8 @@ pub struct ReadRafSumcheck<F: JoltField> {
     gamma: F,
     gamma_squared: F,
     prover_state: Option<ReadRafProverState<F>>,
-
-    r_cycle: Vec<F>,
+    #[allocative(skip)]
+    r_cycle: Vec<u128>,
     rv_claim: F,
     raf_claim: F,
     log_T: usize,
@@ -333,7 +333,7 @@ impl<F: JoltField> SumcheckInstance<F> for ReadRafSumcheck<F> {
     }
 
     #[tracing::instrument(skip_all, name = "InstructionReadRafSumcheck::bind")]
-    fn bind(&mut self, r_j: F, round: usize) {
+    fn bind(&mut self, r_j: u128, round: usize) {
         let ps = self.prover_state.as_mut().unwrap();
         ps.r.push(r_j);
         if round < LOG_K {
@@ -392,7 +392,7 @@ impl<F: JoltField> SumcheckInstance<F> for ReadRafSumcheck<F> {
     fn expected_output_claim(
         &self,
         accumulator: Option<Rc<RefCell<VerifierOpeningAccumulator<F>>>>,
-        r: &[F],
+        r: &[u128],
     ) -> F {
         let (r_address_prime, r_cycle_prime) = r.split_at(LOG_K);
         let left_operand_eval =
@@ -894,9 +894,15 @@ mod tests {
             prover_sm.twist_sumcheck_switch_index,
         );
 
-        let r_cycle: Vec<Fr> = prover_sm.transcript.borrow_mut().challenge_vector(LOG_T);
-        let _r_cycle: Vec<Fr> = verifier_sm.transcript.borrow_mut().challenge_vector(LOG_T);
-        let eq_r_cycle = EqPolynomial::evals(&r_cycle);
+        let r_cycle: Vec<u128> = prover_sm
+            .transcript
+            .borrow_mut()
+            .challenge_vector_u128(LOG_T);
+        let _r_cycle: Vec<u128> = verifier_sm
+            .transcript
+            .borrow_mut()
+            .challenge_vector_u128(LOG_T);
+        let eq_r_cycle = EqPolynomial::<Fr>::evals(&r_cycle);
 
         let mut rv_claim = Fr::zero();
         let mut left_operand_claim = Fr::zero();

@@ -28,6 +28,7 @@ use rayon::prelude::*;
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::u128;
 
 /// Trait for a sumcheck instance that can be batched with other instances.
 ///
@@ -51,30 +52,30 @@ pub trait SumcheckInstance<F: JoltField>: Send + Sync + MaybeAllocative {
 
     /// Binds this sumcheck instance to the verifier's challenge from a specific round.
     /// This updates the internal state to prepare for the next round.
-    fn bind(&mut self, r_j: F, round: usize);
+    fn bind(&mut self, r_j: u128, round: usize);
 
     /// Computes the expected output claim given the verifier's challenges.
     /// This is used to verify the final result of the sumcheck protocol.
     fn expected_output_claim(
         &self,
         opening_accumulator: Option<Rc<RefCell<VerifierOpeningAccumulator<F>>>>,
-        r: &[F],
+        r: &[u128],
     ) -> F;
 
-    fn normalize_opening_point(&self, opening_point: &[F]) -> OpeningPoint<BIG_ENDIAN, F>;
+    fn normalize_opening_point(&self, opening_point: &[u128]) -> OpeningPoint<BIG_ENDIAN>;
 
     /// Caches polynomial opening claims needed after the sumcheck protocol completes.
     /// These openings will later be proven using either an opening proof or another sumcheck.
     fn cache_openings_prover(
         &self,
         accumulator: Rc<RefCell<ProverOpeningAccumulator<F>>>,
-        opening_point: OpeningPoint<BIG_ENDIAN, F>,
+        opening_point: OpeningPoint<BIG_ENDIAN>,
     );
 
     fn cache_openings_verifier(
         &self,
         accumulator: Rc<RefCell<VerifierOpeningAccumulator<F>>>,
-        opening_point: OpeningPoint<BIG_ENDIAN, F>,
+        opening_point: OpeningPoint<BIG_ENDIAN>,
     );
 
     #[cfg(feature = "allocative")]
@@ -88,9 +89,9 @@ impl SingleSumcheck {
         sumcheck_instance: &mut dyn SumcheckInstance<F>,
         opening_accumulator: Option<Rc<RefCell<ProverOpeningAccumulator<F>>>>,
         transcript: &mut ProofTranscript,
-    ) -> (SumcheckInstanceProof<F, ProofTranscript>, Vec<F>) {
+    ) -> (SumcheckInstanceProof<F, ProofTranscript>, Vec<u128>) {
         let num_rounds = sumcheck_instance.num_rounds();
-        let mut r_sumcheck: Vec<F> = Vec::with_capacity(num_rounds);
+        let mut r_sumcheck: Vec<u128> = Vec::with_capacity(num_rounds);
         let mut compressed_polys: Vec<CompressedUniPoly<F>> = Vec::with_capacity(num_rounds);
 
         let mut previous_claim = sumcheck_instance.input_claim();
@@ -105,11 +106,11 @@ impl SingleSumcheck {
             compressed_poly.append_to_transcript(transcript);
             compressed_polys.push(compressed_poly);
 
-            let r_j = transcript.challenge_scalar();
+            let r_j = transcript.challenge_u128();
             r_sumcheck.push(r_j);
 
             // Cache claim for this round
-            previous_claim = univariate_poly.evaluate(&r_j);
+            previous_claim = univariate_poly.evaluate_u128(&r_j);
 
             sumcheck_instance.bind(r_j, round);
         }
@@ -132,7 +133,7 @@ impl SingleSumcheck {
         proof: &SumcheckInstanceProof<F, ProofTranscript>,
         opening_accumulator: Option<Rc<RefCell<VerifierOpeningAccumulator<F>>>>,
         transcript: &mut ProofTranscript,
-    ) -> Result<Vec<F>, ProofVerifyError> {
+    ) -> Result<Vec<u128>, ProofVerifyError> {
         let (output_claim, r) = proof.verify(
             sumcheck_instance.input_claim(),
             sumcheck_instance.num_rounds(),
@@ -165,7 +166,7 @@ impl BatchedSumcheck {
         mut sumcheck_instances: Vec<&mut dyn SumcheckInstance<F>>,
         opening_accumulator: Option<Rc<RefCell<ProverOpeningAccumulator<F>>>>,
         transcript: &mut ProofTranscript,
-    ) -> (SumcheckInstanceProof<F, ProofTranscript>, Vec<F>) {
+    ) -> (SumcheckInstanceProof<F, ProofTranscript>, Vec<u128>) {
         let max_num_rounds = sumcheck_instances
             .iter()
             .map(|sumcheck| sumcheck.num_rounds())
@@ -200,7 +201,7 @@ impl BatchedSumcheck {
             .map(|(claim, coeff)| *claim * coeff)
             .sum();
 
-        let mut r_sumcheck: Vec<F> = Vec::with_capacity(max_num_rounds);
+        let mut r_sumcheck: Vec<u128> = Vec::with_capacity(max_num_rounds);
         let mut compressed_polys: Vec<CompressedUniPoly<F>> = Vec::with_capacity(max_num_rounds);
 
         for round in 0..max_num_rounds {
@@ -251,14 +252,14 @@ impl BatchedSumcheck {
 
             // append the prover's message to the transcript
             compressed_poly.append_to_transcript(transcript);
-            let r_j = transcript.challenge_scalar();
+            let r_j = transcript.challenge_u128();
             r_sumcheck.push(r_j);
 
             // Cache individual claims for this round
             individual_claims
                 .iter_mut()
                 .zip(univariate_polys.into_iter())
-                .for_each(|(claim, poly)| *claim = poly.evaluate(&r_j));
+                .for_each(|(claim, poly)| *claim = poly.evaluate_u128(&r_j));
 
             #[cfg(test)]
             {
@@ -270,7 +271,7 @@ impl BatchedSumcheck {
                     batched_claim,
                     "round {round}: H(0) + H(1) = {h0} + {h1} != {batched_claim}"
                 );
-                batched_claim = batched_univariate_poly.evaluate(&r_j);
+                batched_claim = batched_univariate_poly.evaluate_u128(&r_j);
             }
 
             for sumcheck in sumcheck_instances.iter_mut() {
@@ -318,7 +319,7 @@ impl BatchedSumcheck {
         sumcheck_instances: Vec<&dyn SumcheckInstance<F>>,
         opening_accumulator: Option<Rc<RefCell<VerifierOpeningAccumulator<F>>>>,
         transcript: &mut ProofTranscript,
-    ) -> Result<Vec<F>, ProofVerifyError> {
+    ) -> Result<Vec<u128>, ProofVerifyError> {
         let max_degree = sumcheck_instances
             .iter()
             .map(|sumcheck| sumcheck.degree())
@@ -396,9 +397,9 @@ impl<F: JoltField, ProofTranscript: Transcript> SumcheckInstanceProof<F, ProofTr
         padded_num_constraints: usize,
         uniform_constraints: &[Constraint],
         flattened_polys: &[MultilinearPolynomial<F>],
-        tau: &[F],
+        tau: &[u128],
         transcript: &mut ProofTranscript,
-    ) -> (Self, Vec<F>, [F; 3]) {
+    ) -> (Self, Vec<u128>, [F; 3]) {
         let mut r = Vec::new();
         let mut polys = Vec::new();
         let mut claim = F::zero();
@@ -465,8 +466,8 @@ impl<F: JoltField, ProofTranscript: Transcript> SumcheckInstanceProof<F, ProofTr
         poly_A: &mut DensePolynomial<F>,
         witness_polynomials: &[&MultilinearPolynomial<F>],
         transcript: &mut ProofTranscript,
-    ) -> (Self, Vec<F>, Vec<F>) {
-        let mut r: Vec<F> = Vec::with_capacity(num_rounds);
+    ) -> (Self, Vec<u128>, Vec<F>) {
+        let mut r: Vec<u128> = Vec::with_capacity(num_rounds);
         let mut polys: Vec<CompressedUniPoly<F>> = Vec::with_capacity(num_rounds);
         let mut claim_per_round = *claim;
 
@@ -529,12 +530,12 @@ impl<F: JoltField, ProofTranscript: Transcript> SumcheckInstanceProof<F, ProofTr
         compressed_poly.append_to_transcript(transcript);
 
         //derive the verifier's challenge for the next round
-        let r_i: F = transcript.challenge_scalar();
+        let r_i: u128 = transcript.challenge_u128();
         r.push(r_i);
         polys.push(compressed_poly);
 
         // Set up next round
-        claim_per_round = poly.evaluate(&r_i);
+        claim_per_round = poly.evaluate_u128(&r_i);
 
         // bound all tables to the verifier's challenge
         let (_, mut poly_B) = rayon::join(
@@ -554,7 +555,13 @@ impl<F: JoltField, ProofTranscript: Transcript> SumcheckInstanceProof<F, ProofTr
                 let right_iter = Z_iter.skip(len).take(len);
                 let B = left_iter
                     .zip(right_iter)
-                    .map(|(a, b)| if a == b { a } else { a + r_i * (b - a) })
+                    .map(|(a, b)| {
+                        if a == b {
+                            a
+                        } else {
+                            a + (b - a).mul_u128_mont_form(r_i)
+                        }
+                    })
                     .collect();
                 DensePolynomial::new(B)
             },
@@ -576,13 +583,13 @@ impl<F: JoltField, ProofTranscript: Transcript> SumcheckInstanceProof<F, ProofTr
             compressed_poly.append_to_transcript(transcript);
 
             //derive the verifier's challenge for the next round
-            let r_i: F = transcript.challenge_scalar();
+            let r_i: u128 = transcript.challenge_u128();
 
             r.push(r_i);
             polys.push(compressed_poly);
 
             // Set up next round
-            claim_per_round = poly.evaluate(&r_i);
+            claim_per_round = poly.evaluate_u128(&r_i);
 
             // bound all tables to the verifier's challenge
             rayon::join(
@@ -664,9 +671,9 @@ impl<F: JoltField, ProofTranscript: Transcript> SumcheckInstanceProof<F, ProofTr
         num_rounds: usize,
         degree_bound: usize,
         transcript: &mut ProofTranscript,
-    ) -> Result<(F, Vec<F>), ProofVerifyError> {
+    ) -> Result<(F, Vec<u128>), ProofVerifyError> {
         let mut e = claim;
-        let mut r: Vec<F> = Vec::new();
+        let mut r: Vec<u128> = Vec::new();
 
         // verify that there is a univariate polynomial for each round
         assert_eq!(self.compressed_polys.len(), num_rounds);
@@ -683,11 +690,11 @@ impl<F: JoltField, ProofTranscript: Transcript> SumcheckInstanceProof<F, ProofTr
             self.compressed_polys[i].append_to_transcript(transcript);
 
             //derive the verifier's challenge for the next round
-            let r_i = transcript.challenge_scalar();
+            let r_i = transcript.challenge_u128();
             r.push(r_i);
 
             // evaluate the claimed degree-ell polynomial at r_i using the hint
-            e = self.compressed_polys[i].eval_from_hint(&e, &r_i);
+            e = self.compressed_polys[i].eval_from_hint_u128(&e, &r_i);
         }
 
         Ok((e, r))
@@ -709,11 +716,13 @@ pub fn process_eq_sumcheck_round<F: JoltField, ProofTranscript: Transcript>(
     quadratic_evals: (F, F), // (t_i(0), t_i(infty))
     eq_poly: &mut GruenSplitEqPolynomial<F>,
     polys: &mut Vec<CompressedUniPoly<F>>,
-    r: &mut Vec<F>,
+    r: &mut Vec<u128>,
     claim: &mut F,
     transcript: &mut ProofTranscript,
-) -> F {
-    let scalar_times_w_i = eq_poly.current_scalar * eq_poly.w[eq_poly.current_index - 1];
+) -> u128 {
+    let scalar_times_w_i = eq_poly
+        .current_scalar
+        .mul_u128_mont_form(eq_poly.w[eq_poly.current_index - 1]);
 
     let cubic_poly = UniPoly::from_linear_times_quadratic_with_hint(
         // The coefficients of `eq(w[(n - i)..], r[..i]) * eq(w[n - i - 1], X)`
@@ -731,12 +740,12 @@ pub fn process_eq_sumcheck_round<F: JoltField, ProofTranscript: Transcript>(
     compressed_poly.append_to_transcript(transcript);
 
     // Derive challenge
-    let r_i: F = transcript.challenge_scalar();
+    let r_i: u128 = transcript.challenge_u128();
     r.push(r_i);
     polys.push(compressed_poly);
 
     // Evaluate for next round's claim
-    *claim = cubic_poly.evaluate(&r_i);
+    *claim = cubic_poly.evaluate_u128(&r_i);
 
     // Bind eq_poly for next round
     eq_poly.bind(r_i);

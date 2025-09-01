@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::u128;
 use tracing::{span, Level};
 
 use crate::field::JoltField;
@@ -112,9 +113,9 @@ where
         uniform_constraints_only_padded: usize,
         uniform_constraints: &[Constraint],
         input_polys: &[MultilinearPolynomial<F>],
-        tau: &[F],
+        tau: &[u128],
         transcript: &mut ProofTranscript,
-    ) -> (SumcheckInstanceProof<F, ProofTranscript>, Vec<F>, [F; 3]) {
+    ) -> (SumcheckInstanceProof<F, ProofTranscript>, Vec<u128>, [F; 3]) {
         SumcheckInstanceProof::prove_spartan_small_value::<NUM_SVO_ROUNDS>(
             num_rounds_x,
             uniform_constraints_only_padded,
@@ -674,10 +675,10 @@ where
 
         let num_rounds_x = key.num_rows_bits();
 
-        let tau: Vec<F> = state_manager
+        let tau: Vec<u128> = state_manager
             .transcript
             .borrow_mut()
-            .challenge_vector(num_rounds_x);
+            .challenge_vector_u128(num_rounds_x);
 
         // Recreate constraint_builder from padded_trace_length
         let constraint_builder: CombinedUniformBuilder<F> =
@@ -701,7 +702,7 @@ where
             )
         };
 
-        let outer_sumcheck_r: Vec<F> = outer_sumcheck_r.into_iter().rev().collect();
+        let outer_sumcheck_r: Vec<u128> = outer_sumcheck_r.into_iter().rev().collect();
 
         ProofTranscript::append_scalars(
             &mut *state_manager.transcript.borrow_mut(),
@@ -790,10 +791,10 @@ where
 
         let num_rounds_x = key.num_rows_bits();
 
-        let tau: Vec<F> = state_manager
+        let tau: Vec<u128> = state_manager
             .transcript
             .borrow_mut()
-            .challenge_vector(num_rounds_x);
+            .challenge_vector_u128(num_rounds_x);
 
         // Get the outer sumcheck proof
         let proofs = state_manager.proofs.borrow();
@@ -831,7 +832,7 @@ where
 
         // Outer sumcheck is bound from the top, reverse the challenge
         // TODO(markosg04): Make use of Endianness here?
-        let outer_sumcheck_r_reversed: Vec<F> =
+        let outer_sumcheck_r_reversed: Vec<u128> =
             outer_sumcheck_r_original.iter().rev().cloned().collect();
         let opening_point = OpeningPoint::new(outer_sumcheck_r_reversed.clone());
 

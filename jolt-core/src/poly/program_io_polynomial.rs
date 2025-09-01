@@ -70,13 +70,13 @@ impl<F: JoltField> ProgramIOPolynomial<F> {
         }
     }
 
-    pub fn evaluate(&self, r_address: &[F]) -> F {
+    pub fn evaluate(&self, r_address: &[u128]) -> F {
         let (r_hi, r_lo) = r_address.split_at(r_address.len() - self.poly.get_num_vars());
         debug_assert_eq!(r_lo.len(), self.poly.get_num_vars());
 
         let mut result = self.poly.evaluate(r_lo);
         for r_i in r_hi.iter() {
-            result *= F::one() - r_i;
+            result *= F::one() - F::from_u128(*r_i);
         }
 
         result

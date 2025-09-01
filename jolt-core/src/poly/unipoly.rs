@@ -427,6 +427,24 @@ impl<F: JoltField> CompressedUniPoly<F> {
         running_sum
     }
 
+    // In the verifier we do not have to check that f(0) + f(1) = hint as we can just
+    // recover the linear term assuming the prover did it right, then eval the poly
+    pub fn eval_from_hint_u128(&self, hint: &F, x: &u128) -> F {
+        let mut linear_term =
+            *hint - self.coeffs_except_linear_term[0] - self.coeffs_except_linear_term[0];
+        for i in 1..self.coeffs_except_linear_term.len() {
+            linear_term -= self.coeffs_except_linear_term[i];
+        }
+
+        let mut running_point = *x;
+        let mut running_sum =
+            self.coeffs_except_linear_term[0] + linear_term.mul_u128_mont_form(*x);
+        for i in 1..self.coeffs_except_linear_term.len() {
+            running_point = running_point * x;
+            running_sum += self.coeffs_except_linear_term[i].mul_u128_mont_form(running_point);
+        }
+        running_sum
+    }
     pub fn degree(&self) -> usize {
         self.coeffs_except_linear_term.len()
     }
