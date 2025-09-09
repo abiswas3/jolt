@@ -416,7 +416,6 @@ mod tests {
     #[test]
     #[serial]
     fn fib_e2e_dory() {
-        println!("Time start");
         let start = Instant::now();
         let mut program = host::Program::new("fibonacci-guest");
         let inputs = postcard::to_stdvec(&100u32).unwrap();
@@ -431,8 +430,12 @@ mod tests {
         );
         let elf_contents_opt = program.get_elf_contents();
         let elf_contents = elf_contents_opt.as_deref().expect("elf contents is None");
+
+        println!("Time start");
         let (jolt_proof, io_device, debug_info) =
             JoltRV32IM::prove(&preprocessing, elf_contents, &inputs);
+        let end = start.elapsed();
+        println!("Time end: {}", end.as_millis());
 
         let verifier_preprocessing = JoltVerifierPreprocessing::from(&preprocessing);
         let verification_result =
@@ -442,8 +445,6 @@ mod tests {
             "Verification failed with error: {:?}",
             verification_result.err()
         );
-        let end = start.elapsed();
-        println!("Time end: {}", end.as_millis());
     }
 
     #[test]
