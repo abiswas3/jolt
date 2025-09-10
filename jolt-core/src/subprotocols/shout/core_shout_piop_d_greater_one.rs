@@ -20,8 +20,8 @@ use crate::{
     utils::{errors::ProofVerifyError, math::Math, thread::unsafe_allocate_zero_vec},
 };
 use rayon::prelude::*;
-use std::{cell::RefCell, rc::Rc};
 use std::time::Instant;
+use std::{cell::RefCell, rc::Rc};
 
 /// Implements the sumcheck prover for the generic core Shout PIOP for d>1.
 /// See Figure 7 of https://eprint.iacr.org/2025/105
@@ -359,8 +359,6 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
     // The degree of t is d
     let degree = d;
     for _time_round_idx in 0..T.log_2() {
-
-        let start_unievals = Instant::now();
         let E_2 = greq_r_cycle.E_in_current();
         let E_1 = greq_r_cycle.E_out_current();
 
@@ -471,16 +469,11 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
         compressed_poly.append_to_transcript(transcript);
         compressed_polys.push(compressed_poly);
 
-        let end_unievals = start_unievals.elapsed();
-        println!("Just uni-evals took: {}", end_unievals.as_micros());
-
-
         // Get challenge that binds the variable
         let r_j = transcript.challenge_scalar::<F>();
         r_address.push(r_j);
         previous_claim = univariate_poly.evaluate(&r_j);
 
-        let start_bind = Instant::now();
         rayon::join(
             || {
                 ra_taus.iter_mut().for_each(|ra_tau| {
@@ -489,8 +482,6 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
             },
             || greq_r_cycle.bind(r_j),
         );
-        let end_bind = start_bind.elapsed();
-        println!("One round of binding took: {}", end_bind.as_micros());
     }
 
     let end = start.elapsed();
@@ -612,8 +603,6 @@ mod tests {
             D,
             &mut prover_transcript,
         );
-
-
 
         let mut prover_transcript = Blake2bTranscript::new(b"test_transcript");
         reset_mult_count();
