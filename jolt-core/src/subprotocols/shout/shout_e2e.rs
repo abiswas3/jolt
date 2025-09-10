@@ -14,7 +14,7 @@ use crate::{
         },
         unipoly::{CompressedUniPoly, UniPoly},
     },
-    transcripts::{AppedToTranscript, Transcript},
+    transcripts::{AppendToTranscript, Transcript},
     //subprotocols::sumcheck::CacheSumcheckOpenings,
     utils::{errors::ProofVerifyError, math::Math, thread::unsafe_allocate_zero_vec},
 };
@@ -1275,6 +1275,7 @@ mod tests {
 
     #[test]
     fn raf_evaluation_sumcheck() {
+        println!("Runnng test");
         let start = Instant::now();
         const TABLE_SIZE: usize = 64;
         const NUM_LOOKUPS: usize = 1 << 10;
@@ -1312,6 +1313,6 @@ mod tests {
             verification_result.err()
         );
         let duration = start.elapsed();
-        println!("Large field raf: {}ms", duration.as_millis());
+        println!("Large field raf: {}ms", duration.as_micros());
     }
 }
