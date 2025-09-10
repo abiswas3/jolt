@@ -1,8 +1,8 @@
 use crate::{field::JoltField, poly::eq_poly::EqPolynomial};
 use rayon::prelude::*;
 
-type ConstructFinalSumcheckEvalsFn<F: JoltField> =
-    fn(univariate_poly_evals: &[F], val_claim: F, previous_claim: F, degree: usize) -> Vec<F>;
+
+
 
 /// Constructs the evaluations of the final univariate polynomial for sumcheck in parallel.
 ///
