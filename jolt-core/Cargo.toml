@@ -136,6 +136,10 @@ harness = false
 name = "compact_poly_bench"
 harness = false
 
+[[bench]]
+name = "shout_d_is_one_bench"
+harness = false
+
 [lib]
 name = "jolt_core"
 path = "src/lib.rs"
