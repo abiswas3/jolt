@@ -281,8 +281,6 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
     // Binding the first log_2 K variables
     const DEGREE_ADDR: usize = 2; // independent of d
     let mut compressed_polys: Vec<CompressedUniPoly<F>> = Vec::with_capacity(num_rounds);
-    println!("Starting Sum-check K");
-    let start = Instant::now();
     for _addr_idx in 0..K.log_2() {
         // Page 51: (eq 51)
         let univariate_poly_evals: [F; DEGREE_ADDR] = (0..ra.len() / 2)
@@ -316,8 +314,6 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
             || val.bind_parallel(r_j, BindingOrder::LowToHigh),
         );
     }
-    let end = start.elapsed();
-    println!("Sumcheck K over: {}", end.as_micros());
 
     // tau = r_address (the verifiers challenges which bind all log K variables of memory)
     // This is \widetilde{Val}(\tau) from the paper (eq 52)
@@ -349,12 +345,7 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
     // as they start with size \sqrt{T} which is below 16
     // which is the parallel threshold as max T = 2**32
 
-    println!("Starting Sumcheck For T");
-    let start = Instant::now();
-    let start_greq = Instant::now();
     let mut greq_r_cycle = GruenSplitEqPolynomial::new(&r_cycle, BindingOrder::LowToHigh);
-    let end_greq = start_greq.elapsed();
-    println!("Just greq took: {}", end_greq.as_micros());
     // This how many evals we need to evaluate t(x)
     // The degree of t is d
     let degree = d;
@@ -484,8 +475,6 @@ pub fn prove_generic_core_shout_pip_d_greater_than_one_with_gruen<
         );
     }
 
-    let end = start.elapsed();
-    println!("Sumcheck T over: {}", end.as_micros());
     let ras_raddress_rtime_product: F = ra_taus
         .par_iter()
         .map(|ra| ra.final_sumcheck_claim())
