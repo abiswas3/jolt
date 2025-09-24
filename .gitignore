@@ -45,3 +45,5 @@ bin/act
 
 # Inline Traces
 *.joltinline
+jolt-core/target/criterion
+blog.md
