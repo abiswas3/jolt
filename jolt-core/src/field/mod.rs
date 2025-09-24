@@ -64,15 +64,8 @@ pub trait JoltField:
         + Add<Self::Challenge, Output = Self>
         + Sub<Self::Challenge, Output = Self>
         + Mul<Self::Challenge, Output = Self>
-        //+ AddAssign<Self>
-        //+ SubAssign<Self>
-        //+ MulAssign<Self>
         + Mul<Self, Output = Self>
         + for<'a> Mul<&'a Self, Output = Self>
-        //+ core::iter::Sum<Self::Challenge>
-        //+ for<'a> core::iter::Sum<&'a Self::Challenge>
-        //+ core::iter::Product<Self::Challenge>
-        //+ for<'a> core::iter::Product<&'a Self::Challenge>
         + CanonicalSerialize
         + CanonicalDeserialize
         + MaybeAllocative
