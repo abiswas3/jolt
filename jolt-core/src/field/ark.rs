@@ -1,8 +1,8 @@
 use ark_ff::{prelude::*, BigInt, PrimeField, UniformRand};
 use rayon::prelude::*;
-use std::ops::Mul;
+use std::ops::{Add, Mul, Sub};
 
-use crate::utils::thread::unsafe_allocate_zero_vec;
+use crate::{field::challenge::MontU128Challenge, utils::thread::unsafe_allocate_zero_vec};
 
 use super::{challenge::TrivialChallenge, FieldOps, JoltField};
 
@@ -14,10 +14,96 @@ lazy_static::lazy_static! {
     static ref SMALL_VALUE_LOOKUP_TABLES: [Vec<ark_bn254::Fr>; 2] = ark_bn254::Fr::compute_lookup_tables();
 }
 
+//-------------------------------Add/sub/mul
+impl Add for MontU128Challenge<ark_bn254::Fr> {
+    type Output = ark_bn254::Fr;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        let lhs_bigint = BigInt::new(self.value());
+        let rhs_bigint = BigInt::new(rhs.value());
+
+        // Convert BigInt to field element (unchecked)
+        let lhs_fr = ark_bn254::Fr::from_bigint_unchecked(lhs_bigint).unwrap();
+        let rhs_fr = ark_bn254::Fr::from_bigint_unchecked(rhs_bigint).unwrap();
+
+        // Add in the field
+        lhs_fr + rhs_fr
+    }
+}
+
+impl Sub for MontU128Challenge<ark_bn254::Fr> {
+    type Output = ark_bn254::Fr;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        let lhs_bigint = BigInt::new(self.value());
+        let rhs_bigint = BigInt::new(rhs.value());
+
+        // Convert BigInt to field element (unchecked)
+        let lhs_fr = ark_bn254::Fr::from_bigint_unchecked(lhs_bigint).unwrap();
+        let rhs_fr = ark_bn254::Fr::from_bigint_unchecked(rhs_bigint).unwrap();
+
+        // Add in the field
+        lhs_fr - rhs_fr
+    }
+}
+
+impl Mul for MontU128Challenge<ark_bn254::Fr> {
+    type Output = ark_bn254::Fr;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        let lhs_bigint = BigInt::new(self.value());
+        let lhs_fr = ark_bn254::Fr::from_bigint_unchecked(lhs_bigint).unwrap();
+        lhs_fr.mul_hi_u128(rhs.value())
+    }
+}
+
+// ---------------------------------------------------------------
+// Critical: Challenge * F -> F
+impl Mul<ark_bn254::Fr> for MontU128Challenge<ark_bn254::Fr> {
+    type Output = ark_bn254::Fr;
+
+    fn mul(self, rhs: ark_bn254::Fr) -> ark_bn254::Fr {
+        // Use the special ark_bn254 multiplication method
+        rhs.mul_hi_u128(self.value())
+    }
+}
+
+impl Mul<&ark_bn254::Fr> for MontU128Challenge<ark_bn254::Fr> {
+    type Output = ark_bn254::Fr;
+
+    fn mul(self, rhs: &ark_bn254::Fr) -> ark_bn254::Fr {
+        (*rhs).mul_hi_u128(self.value())
+    }
+}
+
+impl Mul<&ark_bn254::Fr> for &MontU128Challenge<ark_bn254::Fr> {
+    type Output = ark_bn254::Fr;
+
+    fn mul(self, rhs: &ark_bn254::Fr) -> ark_bn254::Fr {
+        (*rhs).mul_hi_u128(self.value())
+    }
+}
+
+impl Mul<ark_bn254::Fr> for &MontU128Challenge<ark_bn254::Fr> {
+    type Output = ark_bn254::Fr;
+
+    fn mul(self, rhs: ark_bn254::Fr) -> ark_bn254::Fr {
+        rhs.mul_hi_u128(self.value())
+    }
+}
+//--------------------------------------------------------------------------------
+//from u128
+impl From<u128> for MontU128Challenge<ark_bn254::Fr> {
+    fn from(value: u128) -> Self {
+        Self::new(value)
+    }
+}
+
 impl JoltField for ark_bn254::Fr {
     const NUM_BYTES: usize = 32;
     type SmallValueLookupTables = [Vec<Self>; 2];
-    type Challenge = TrivialChallenge<Self>;
+    type Challenge = MontU128Challenge<Self>;
+    //type Challenge = TrivialChallenge<Self>;
 
     fn random<R: rand_core::RngCore>(rng: &mut R) -> Self {
         <Self as UniformRand>::rand(rng)
