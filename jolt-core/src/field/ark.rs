@@ -14,119 +14,123 @@ lazy_static::lazy_static! {
     static ref SMALL_VALUE_LOOKUP_TABLES: [Vec<ark_bn254::Fr>; 2] = ark_bn254::Fr::compute_lookup_tables();
 }
 
-impl Add for MontU128Challenge<ark_bn254::Fr> {
-    type Output = ark_bn254::Fr;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        let lhs_bigint = BigInt::new(self.value());
-        let rhs_bigint = BigInt::new(rhs.value());
-
-        // Convert BigInt to field element (unchecked)
-        let lhs_fr = ark_bn254::Fr::from_bigint_unchecked(lhs_bigint).unwrap();
-        let rhs_fr = ark_bn254::Fr::from_bigint_unchecked(rhs_bigint).unwrap();
-
-        // Add in the field
-        lhs_fr + rhs_fr
+impl MontU128Challenge<ark_bn254::Fr> {
+    #[inline(always)]
+    fn as_fr(&self) -> ark_bn254::Fr {
+        ark_bn254::Fr::from_bigint_unchecked(BigInt::new(self.value())).unwrap()
     }
 }
 
-impl Sub for MontU128Challenge<ark_bn254::Fr> {
-    type Output = ark_bn254::Fr;
+macro_rules! impl_field_ops_inline {
+    ($t:ty, $f:ty) => {
+        // t + t -> f
+        impl Add<$t> for $t {
+            type Output = $f;
+            #[inline(always)]
+            fn add(self, rhs: Self) -> Self::Output {
+                self.as_fr() + rhs.as_fr()
+            }
+        }
 
-    fn sub(self, rhs: Self) -> Self::Output {
-        let lhs_bigint = BigInt::new(self.value());
-        let lhs_fr = ark_bn254::Fr::from_bigint_unchecked(lhs_bigint).unwrap();
+        // t - t -> f
+        impl Sub<$t> for $t {
+            type Output = $f;
+            #[inline(always)]
+            fn sub(self, rhs: Self) -> Self::Output {
+                self.as_fr() - rhs.as_fr()
+            }
+        }
 
-        let rhs_bigint = BigInt::new(rhs.value());
-        let rhs_fr = ark_bn254::Fr::from_bigint_unchecked(rhs_bigint).unwrap();
+        // t * t -> f
+        impl Mul<$t> for $t {
+            type Output = $f;
+            #[inline(always)]
+            fn mul(self, rhs: Self) -> Self::Output {
+                self.as_fr() * rhs.as_fr()
+            }
+        }
 
-        // Add in the field
-        lhs_fr - rhs_fr
-    }
+        // t * f -> f
+        impl Mul<$f> for $t {
+            type Output = $f;
+            #[inline(always)]
+            fn mul(self, rhs: $f) -> $f {
+                rhs.mul_hi_u128(self.value())
+            }
+        }
+
+        // t * &f -> f
+        impl Mul<&$f> for $t {
+            type Output = $f;
+            #[inline(always)]
+            fn mul(self, rhs: &$f) -> $f {
+                (*rhs).mul_hi_u128(self.value())
+            }
+        }
+
+        // f * t -> f
+        impl Mul<$t> for $f {
+            type Output = $f;
+            #[inline(always)]
+            fn mul(self, rhs: $t) -> $f {
+                self.mul_hi_u128(rhs.value())
+            }
+        }
+
+        // f * &t -> f
+        impl Mul<&$t> for $f {
+            type Output = $f;
+            #[inline(always)]
+            fn mul(self, rhs: &$t) -> $f {
+                self.mul_hi_u128(rhs.value())
+            }
+        }
+
+        // f - t -> f
+        impl Sub<$t> for $f {
+            type Output = $f;
+            #[inline(always)]
+            fn sub(self, rhs: $t) -> $f {
+                self - rhs.as_fr()
+            }
+        }
+
+        // f + t -> f
+        impl Add<$t> for $f {
+            type Output = $f;
+            #[inline(always)]
+            fn add(self, rhs: $t) -> $f {
+                self + rhs.as_fr()
+            }
+        }
+
+        // f - &t -> f
+        impl Sub<&$t> for $f {
+            type Output = $f;
+            #[inline(always)]
+            fn sub(self, rhs: &$t) -> $f {
+                self - rhs.as_fr()
+            }
+        }
+
+        // f + &t -> f
+        impl Add<&$t> for $f {
+            type Output = $f;
+            #[inline(always)]
+            fn add(self, rhs: &$t) -> $f {
+                self + rhs.as_fr()
+            }
+        }
+    };
 }
 
-impl Mul for MontU128Challenge<ark_bn254::Fr> {
-    type Output = ark_bn254::Fr;
-
-    fn mul(self, rhs: Self) -> Self::Output {
-        let lhs_bigint = BigInt::new(self.value());
-        let lhs_fr = ark_bn254::Fr::from_bigint_unchecked(lhs_bigint).unwrap();
-        lhs_fr.mul_hi_u128(rhs.value())
-    }
-}
-
-// ---------------------------------------------------------------
-// Critical: Challenge * F -> F
-impl Mul<ark_bn254::Fr> for MontU128Challenge<ark_bn254::Fr> {
-    type Output = ark_bn254::Fr;
-
-    fn mul(self, rhs: ark_bn254::Fr) -> ark_bn254::Fr {
-        // Use the special ark_bn254 multiplication method
-        rhs.mul_hi_u128(self.value())
-    }
-}
-
-impl Mul<&ark_bn254::Fr> for MontU128Challenge<ark_bn254::Fr> {
-    type Output = ark_bn254::Fr;
-
-    fn mul(self, rhs: &ark_bn254::Fr) -> ark_bn254::Fr {
-        (*rhs).mul_hi_u128(self.value())
-    }
-}
-
-impl Mul<&ark_bn254::Fr> for &MontU128Challenge<ark_bn254::Fr> {
-    type Output = ark_bn254::Fr;
-
-    fn mul(self, rhs: &ark_bn254::Fr) -> ark_bn254::Fr {
-        (*rhs).mul_hi_u128(self.value())
-    }
-}
-
-impl Mul<ark_bn254::Fr> for &MontU128Challenge<ark_bn254::Fr> {
-    type Output = ark_bn254::Fr;
-
-    fn mul(self, rhs: ark_bn254::Fr) -> ark_bn254::Fr {
-        rhs.mul_hi_u128(self.value())
-    }
-}
+impl_field_ops_inline!(MontU128Challenge<ark_bn254::Fr>, ark_bn254::Fr);
 
 impl From<u128> for MontU128Challenge<ark_bn254::Fr> {
     fn from(value: u128) -> Self {
         Self::new(value)
     }
 }
-
-// Fr - MontU128
-impl Sub<MontU128Challenge<ark_bn254::Fr>> for ark_bn254::Fr {
-    type Output = ark_bn254::Fr;
-    #[inline(always)]
-    fn sub(self, rhs: MontU128Challenge<ark_bn254::Fr>) -> Self::Output {
-        let rhs_bigint = BigInt::new(rhs.value());
-        let rhs_fr = ark_bn254::Fr::from_bigint_unchecked(rhs_bigint).unwrap();
-        self - rhs_fr
-    }
-}
-
-// Fr + MontU128
-impl Add<MontU128Challenge<ark_bn254::Fr>> for ark_bn254::Fr {
-    type Output = ark_bn254::Fr;
-    #[inline(always)]
-    fn add(self, rhs: MontU128Challenge<ark_bn254::Fr>) -> Self::Output {
-        let rhs_bigint = BigInt::new(rhs.value());
-        let rhs_fr = ark_bn254::Fr::from_bigint_unchecked(rhs_bigint).unwrap();
-        self + rhs_fr
-    }
-}
-
-// Fr * MontU128Challenge
-impl Mul<MontU128Challenge<ark_bn254::Fr>> for ark_bn254::Fr {
-    type Output = ark_bn254::Fr;
-    #[inline(always)]
-    fn mul(self, rhs: MontU128Challenge<ark_bn254::Fr>) -> Self::Output {
-        self.mul_hi_u128(rhs.value())
-    }
-}
-
 impl Mul<TrivialChallenge<ark_bn254::Fr>> for ark_bn254::Fr {
     type Output = Self;
 
@@ -134,28 +138,11 @@ impl Mul<TrivialChallenge<ark_bn254::Fr>> for ark_bn254::Fr {
         self * rhs.value()
     }
 }
-// Fr * &MontU128Challenge
-impl<'a> Mul<&'a MontU128Challenge<ark_bn254::Fr>> for ark_bn254::Fr {
-    type Output = Self;
-
-    fn mul(self, rhs: &'a MontU128Challenge<Self>) -> Self {
-        self.mul_hi_u128(rhs.value())
-    }
-}
-
 impl<'a> Mul<&'a TrivialChallenge<ark_bn254::Fr>> for ark_bn254::Fr {
     type Output = Self;
 
     fn mul(self, rhs: &'a TrivialChallenge<Self>) -> Self {
         self * rhs.value()
-    }
-}
-
-impl<'a> Mul<&'a MontU128Challenge<ark_bn254::Fr>> for &'a ark_bn254::Fr {
-    type Output = ark_bn254::Fr;
-
-    fn mul(self, rhs: &'a MontU128Challenge<ark_bn254::Fr>) -> ark_bn254::Fr {
-        self.mul_hi_u128(rhs.value())
     }
 }
 
