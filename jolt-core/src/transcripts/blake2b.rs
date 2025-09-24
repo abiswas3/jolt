@@ -294,7 +294,7 @@ mod tests {
 
         let challenge = transcript1.challenge_scalar_special::<Fr>();
         // The same challenge as a full fat Fr element
-        let challenge_regular = Fr::new_unchecked(BigInt(challenge.value()));
+        let challenge_regular = challenge.as_fr();
 
         let field_elements: Vec<Fr> = (0..10).map(|_| Fr::rand(&mut rng)).collect();
 

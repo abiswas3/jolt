@@ -16,8 +16,15 @@ lazy_static::lazy_static! {
 
 impl MontU128Challenge<ark_bn254::Fr> {
     #[inline(always)]
-    fn as_fr(&self) -> ark_bn254::Fr {
+    pub fn as_fr(&self) -> ark_bn254::Fr {
         ark_bn254::Fr::from_bigint_unchecked(BigInt::new(self.value())).unwrap()
+    }
+}
+
+impl TrivialChallenge<ark_bn254::Fr> {
+    #[inline(always)]
+    pub fn as_fr(&self) -> ark_bn254::Fr {
+        self.value()
     }
 }
 
@@ -157,8 +164,8 @@ impl<'a> Mul<&'a TrivialChallenge<ark_bn254::Fr>> for &'a ark_bn254::Fr {
 impl JoltField for ark_bn254::Fr {
     const NUM_BYTES: usize = 32;
     type SmallValueLookupTables = [Vec<Self>; 2];
-    type Challenge = MontU128Challenge<Self>;
-    //type Challenge = TrivialChallenge<Self>;
+    //type Challenge = MontU128Challenge<Self>;
+    type Challenge = TrivialChallenge<Self>;
 
     fn random<R: rand_core::RngCore>(rng: &mut R) -> Self {
         <Self as UniformRand>::rand(rng)
