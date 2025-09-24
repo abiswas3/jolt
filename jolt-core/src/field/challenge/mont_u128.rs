@@ -1,13 +1,9 @@
 use crate::field::JoltField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-//use ark_std::{One, Zero};
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::marker::PhantomData;
-//use std::iter::{Product, Sum};
-use std::ops::*;
 
-// TODO: Change this
 /// Bespoke implementation of Challenge type that is a subset of the JoltField
 /// with the property that the 2 least significant digits are 0'd out, and it needs
 /// 125 bits to represent.

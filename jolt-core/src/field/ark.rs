@@ -14,7 +14,6 @@ lazy_static::lazy_static! {
     static ref SMALL_VALUE_LOOKUP_TABLES: [Vec<ark_bn254::Fr>; 2] = ark_bn254::Fr::compute_lookup_tables();
 }
 
-//-------------------------------Add/sub/mul
 impl Add for MontU128Challenge<ark_bn254::Fr> {
     type Output = ark_bn254::Fr;
 
@@ -36,10 +35,9 @@ impl Sub for MontU128Challenge<ark_bn254::Fr> {
 
     fn sub(self, rhs: Self) -> Self::Output {
         let lhs_bigint = BigInt::new(self.value());
-        let rhs_bigint = BigInt::new(rhs.value());
-
-        // Convert BigInt to field element (unchecked)
         let lhs_fr = ark_bn254::Fr::from_bigint_unchecked(lhs_bigint).unwrap();
+
+        let rhs_bigint = BigInt::new(rhs.value());
         let rhs_fr = ark_bn254::Fr::from_bigint_unchecked(rhs_bigint).unwrap();
 
         // Add in the field
@@ -91,11 +89,81 @@ impl Mul<ark_bn254::Fr> for &MontU128Challenge<ark_bn254::Fr> {
         rhs.mul_hi_u128(self.value())
     }
 }
-//--------------------------------------------------------------------------------
-//from u128
+
 impl From<u128> for MontU128Challenge<ark_bn254::Fr> {
     fn from(value: u128) -> Self {
         Self::new(value)
+    }
+}
+
+// Fr - MontU128
+impl Sub<MontU128Challenge<ark_bn254::Fr>> for ark_bn254::Fr {
+    type Output = ark_bn254::Fr;
+    #[inline(always)]
+    fn sub(self, rhs: MontU128Challenge<ark_bn254::Fr>) -> Self::Output {
+        let rhs_bigint = BigInt::new(rhs.value());
+        let rhs_fr = ark_bn254::Fr::from_bigint_unchecked(rhs_bigint).unwrap();
+        self - rhs_fr
+    }
+}
+
+// Fr + MontU128
+impl Add<MontU128Challenge<ark_bn254::Fr>> for ark_bn254::Fr {
+    type Output = ark_bn254::Fr;
+    #[inline(always)]
+    fn add(self, rhs: MontU128Challenge<ark_bn254::Fr>) -> Self::Output {
+        let rhs_bigint = BigInt::new(rhs.value());
+        let rhs_fr = ark_bn254::Fr::from_bigint_unchecked(rhs_bigint).unwrap();
+        self + rhs_fr
+    }
+}
+
+// Fr * MontU128Challenge
+impl Mul<MontU128Challenge<ark_bn254::Fr>> for ark_bn254::Fr {
+    type Output = ark_bn254::Fr;
+    #[inline(always)]
+    fn mul(self, rhs: MontU128Challenge<ark_bn254::Fr>) -> Self::Output {
+        self.mul_hi_u128(rhs.value())
+    }
+}
+
+impl Mul<TrivialChallenge<ark_bn254::Fr>> for ark_bn254::Fr {
+    type Output = Self;
+
+    fn mul(self, rhs: TrivialChallenge<Self>) -> Self {
+        self * rhs.value()
+    }
+}
+// Fr * &MontU128Challenge
+impl<'a> Mul<&'a MontU128Challenge<ark_bn254::Fr>> for ark_bn254::Fr {
+    type Output = Self;
+
+    fn mul(self, rhs: &'a MontU128Challenge<Self>) -> Self {
+        self.mul_hi_u128(rhs.value())
+    }
+}
+
+impl<'a> Mul<&'a TrivialChallenge<ark_bn254::Fr>> for ark_bn254::Fr {
+    type Output = Self;
+
+    fn mul(self, rhs: &'a TrivialChallenge<Self>) -> Self {
+        self * rhs.value()
+    }
+}
+
+impl<'a> Mul<&'a MontU128Challenge<ark_bn254::Fr>> for &'a ark_bn254::Fr {
+    type Output = ark_bn254::Fr;
+
+    fn mul(self, rhs: &'a MontU128Challenge<ark_bn254::Fr>) -> ark_bn254::Fr {
+        self.mul_hi_u128(rhs.value())
+    }
+}
+
+impl<'a> Mul<&'a TrivialChallenge<ark_bn254::Fr>> for &'a ark_bn254::Fr {
+    type Output = ark_bn254::Fr;
+
+    fn mul(self, rhs: &'a TrivialChallenge<ark_bn254::Fr>) -> ark_bn254::Fr {
+        *self * rhs.value()
     }
 }
 
@@ -276,31 +344,6 @@ impl JoltField for ark_bn254::Fr {
     #[inline(always)]
     fn mul_u128(&self, n: u128) -> Self {
         ark_ff::Fp::mul_u128(*self, n)
-    }
-}
-
-// Implement F * Challenge -> F
-impl Mul<TrivialChallenge<ark_bn254::Fr>> for ark_bn254::Fr {
-    type Output = Self;
-
-    fn mul(self, rhs: TrivialChallenge<Self>) -> Self {
-        self * rhs.value()
-    }
-}
-
-impl<'a> Mul<&'a TrivialChallenge<ark_bn254::Fr>> for ark_bn254::Fr {
-    type Output = Self;
-
-    fn mul(self, rhs: &'a TrivialChallenge<Self>) -> Self {
-        self * rhs.value()
-    }
-}
-
-impl<'a> Mul<&'a TrivialChallenge<ark_bn254::Fr>> for &'a ark_bn254::Fr {
-    type Output = ark_bn254::Fr;
-
-    fn mul(self, rhs: &'a TrivialChallenge<ark_bn254::Fr>) -> ark_bn254::Fr {
-        *self * rhs.value()
     }
 }
 
