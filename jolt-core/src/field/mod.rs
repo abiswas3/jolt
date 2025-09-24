@@ -60,7 +60,6 @@ pub trait JoltField:
         + Default
         + Eq
         + Hash
-        //+ Neg<Output = Self>
         + Add<Self::Challenge, Output = Self>
         + Sub<Self::Challenge, Output = Self>
         + Mul<Self::Challenge, Output = Self>
@@ -70,7 +69,6 @@ pub trait JoltField:
         + CanonicalDeserialize
         + MaybeAllocative
         + From<u128>;
-    //+ From<Self>;
 
     fn random<R: rand_core::RngCore>(rng: &mut R) -> Self;
     /// Computes the small-value lookup tables.
