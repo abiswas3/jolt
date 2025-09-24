@@ -244,11 +244,13 @@ impl Transcript for Blake2bTranscript {
             .collect::<Vec<F::Challenge>>()
     }
 
-    fn challenge_scalar_powers_special<F: JoltField>(&mut self, len: usize) -> Vec<F::Challenge> {
+    fn challenge_scalar_powers_special<F: JoltField>(&mut self, len: usize) -> Vec<F> {
+        // This is still different from challenge_scalar_powers as inside the for loop
+        // we use an optimised multiplication every time we compute the powers.
         let q: F::Challenge = self.challenge_scalar_special::<F>();
-        let mut q_powers = vec![<F::Challenge as ark_std::One>::one(); len];
+        let mut q_powers = vec![<F as ark_std::One>::one(); len];
         for i in 1..len {
-            q_powers[i] = q_powers[i - 1] * q;
+            q_powers[i] = q * q_powers[i - 1]; // this is optimised
         }
         q_powers
     }
@@ -307,6 +309,7 @@ mod tests {
         }
 
         let field_elem = Fr::rand(&mut rng);
+        #[allow(clippy::op_ref)]
         let result_ref = field_elem * &challenge;
         let result_regular = field_elem * challenge.value();
         assert_eq!(
@@ -324,8 +327,7 @@ mod tests {
 
         for i in 0..5 {
             assert_eq!(
-                challenge_powers[i].value(),
-                challenge_powers_regular[i],
+                challenge_powers[i], challenge_powers_regular[i],
                 "Challenge power mismatch at index {i}"
             );
         }

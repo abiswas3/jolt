@@ -244,11 +244,11 @@ impl Transcript for KeccakTranscript {
             .collect::<Vec<F::Challenge>>()
     }
 
-    fn challenge_scalar_powers_special<F: JoltField>(&mut self, len: usize) -> Vec<F::Challenge> {
+    fn challenge_scalar_powers_special<F: JoltField>(&mut self, len: usize) -> Vec<F> {
         let q: F::Challenge = self.challenge_scalar_special::<F>();
-        let mut q_powers = vec![<F::Challenge as ark_std::One>::one(); len];
+        let mut q_powers = vec![<F as ark_std::One>::one(); len];
         for i in 1..len {
-            q_powers[i] = q_powers[i - 1] * q;
+            q_powers[i] = q * q_powers[i - 1];
         }
         q_powers
     }

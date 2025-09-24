@@ -24,7 +24,7 @@ pub trait Transcript: Default + Clone + Sync + Send + 'static {
     // New methods that return F::Challenge
     fn challenge_scalar_special<F: JoltField>(&mut self) -> F::Challenge;
     fn challenge_vector_special<F: JoltField>(&mut self, len: usize) -> Vec<F::Challenge>;
-    fn challenge_scalar_powers_special<F: JoltField>(&mut self, len: usize) -> Vec<F::Challenge>;
+    fn challenge_scalar_powers_special<F: JoltField>(&mut self, len: usize) -> Vec<F>;
 }
 
 pub trait AppendToTranscript {
