@@ -355,17 +355,22 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ReadRafSumcheck<F> 
         }
     }
 
+    // TODO: (ari) this is on the slow path from my finding
     #[tracing::instrument(skip_all, name = "InstructionReadRafSumcheck::bind")]
     fn bind(&mut self, r_j: F::Challenge, round: usize) {
         let ps = self.prover_state.as_mut().unwrap();
         ps.r.push(r_j);
+        // TODO:(ari) The thing to try here is to flatten the spawn and bring back parallelism.
+        // If this speeds our life up, we are in business.
         if round < LOG_K {
             rayon::scope(|s| {
                 s.spawn(|_| {
-                    ps.suffix_polys.par_iter_mut().for_each(|polys| {
+                    ps.suffix_polys.iter_mut().for_each(|polys| {
+                        // to seq
                         polys
-                            .par_iter_mut()
-                            .for_each(|poly| poly.bind_parallel(r_j, BindingOrder::HighToLow))
+                            .iter_mut() // to seq
+                            .for_each(|poly| poly.bind(r_j, BindingOrder::HighToLow))
+                        // to seq, there is a filter here (i'm not sure that helps)
                     });
                 });
                 s.spawn(|_| ps.identity_ps.bind(r_j));

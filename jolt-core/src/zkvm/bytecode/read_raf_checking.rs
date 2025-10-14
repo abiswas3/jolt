@@ -44,6 +44,7 @@ use tracer::instruction::NormalizedInstruction;
 /// Number of batched read-checking sumchecks bespokely
 const STAGES: usize = 3;
 
+// TODO:: (ari) : should change the F's in this to something different unless it's a pain.
 #[derive(Allocative)]
 struct ReadCheckingProverState<F: JoltField> {
     F: [MultilinearPolynomial<F>; STAGES],
