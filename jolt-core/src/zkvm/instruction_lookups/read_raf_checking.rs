@@ -369,7 +369,10 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ReadRafSumcheck<F> 
                         // to seq
                         polys
                             .iter_mut() // to seq
-                            .for_each(|poly| poly.bind(r_j, BindingOrder::HighToLow))
+                            .for_each(|poly| {
+                                //println!("RAF poly size: {}", poly.len);
+                                poly.bind(r_j, BindingOrder::HighToLow);
+                            })
                         // to seq, there is a filter here (i'm not sure that helps)
                     });
                 });

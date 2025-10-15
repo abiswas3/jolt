@@ -89,9 +89,11 @@ impl<F: JoltField> DensePolynomial<F> {
         let n = self.len() / 2;
         let (left, right) = self.Z.split_at_mut(n);
 
-        left.iter_mut().zip(right.iter()).for_each(|(a, b)| {
-            *a += *r * (*b - *a);
-        });
+        left.par_iter_mut()
+            .zip(right.par_iter())
+            .for_each(|(a, b)| {
+                *a += *r * (*b - *a);
+            });
 
         self.num_vars -= 1;
         self.len = n;
@@ -123,14 +125,25 @@ impl<F: JoltField> DensePolynomial<F> {
     pub fn bound_poly_var_top_zero_optimized(&mut self, r: &F::Challenge) {
         let n = self.len() / 2;
 
-        let (left, right) = self.Z.split_at_mut(n);
+        if self.num_vars >= 18 {
+            let (left, right) = self.Z.split_at_mut(n);
 
-        left.par_iter_mut()
-            .zip(right.par_iter())
-            .filter(|(&mut a, &b)| a != b)
-            .for_each(|(a, b)| {
-                *a += *r * (*b - *a);
-            });
+            left.par_iter_mut()
+                .zip(right.par_iter())
+                .filter(|(&mut a, &b)| a != b)
+                .for_each(|(a, b)| {
+                    *a += *r * (*b - *a);
+                });
+        } else {
+            let (left, right) = self.Z.split_at_mut(n);
+
+            left.iter_mut()
+                .zip(right.iter())
+                .filter(|(&mut a, &b)| a != b)
+                .for_each(|(a, b)| {
+                    *a += *r * (*b - *a);
+                });
+        }
 
         self.num_vars -= 1;
         self.len = n;

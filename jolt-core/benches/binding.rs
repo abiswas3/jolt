@@ -145,26 +145,26 @@ fn main() {
         .configure_from_args()
         .warm_up_time(std::time::Duration::from_secs(5));
 
+    benchmark_dense::<Fr>(&mut criterion, 16);
+    benchmark_dense::<Fr>(&mut criterion, 18);
     benchmark_dense::<Fr>(&mut criterion, 20);
-    benchmark_dense::<Fr>(&mut criterion, 22);
-    benchmark_dense::<Fr>(&mut criterion, 24);
 
-    benchmark_dense_batch::<Fr>(&mut criterion, 20, 4);
-    benchmark_dense_batch::<Fr>(&mut criterion, 20, 8);
-    benchmark_dense_batch::<Fr>(&mut criterion, 20, 16);
-    benchmark_dense_batch::<Fr>(&mut criterion, 20, 32);
-
-    benchmark_dense_parallel::<Fr>(&mut criterion, 22, BindingOrder::LowToHigh);
-    benchmark_dense_parallel::<Fr>(&mut criterion, 24, BindingOrder::LowToHigh);
-    benchmark_dense_parallel::<Fr>(&mut criterion, 26, BindingOrder::LowToHigh);
-
-    benchmark_dense_parallel::<Fr>(&mut criterion, 22, BindingOrder::HighToLow);
-    benchmark_dense_parallel::<Fr>(&mut criterion, 24, BindingOrder::HighToLow);
-    benchmark_dense_parallel::<Fr>(&mut criterion, 26, BindingOrder::HighToLow);
-
-    benchmark_compact::<Fr>(&mut criterion, 22, BindingOrder::LowToHigh);
-    benchmark_compact::<Fr>(&mut criterion, 24, BindingOrder::LowToHigh);
-    benchmark_compact::<Fr>(&mut criterion, 26, BindingOrder::LowToHigh);
-
+    //benchmark_dense_batch::<Fr>(&mut criterion, 20, 4);
+    //benchmark_dense_batch::<Fr>(&mut criterion, 20, 8);
+    //benchmark_dense_batch::<Fr>(&mut criterion, 20, 16);
+    //benchmark_dense_batch::<Fr>(&mut criterion, 20, 32);
+    //
+    //benchmark_dense_parallel::<Fr>(&mut criterion, 22, BindingOrder::LowToHigh);
+    //benchmark_dense_parallel::<Fr>(&mut criterion, 24, BindingOrder::LowToHigh);
+    //benchmark_dense_parallel::<Fr>(&mut criterion, 26, BindingOrder::LowToHigh);
+    //
+    //benchmark_dense_parallel::<Fr>(&mut criterion, 22, BindingOrder::HighToLow);
+    //benchmark_dense_parallel::<Fr>(&mut criterion, 24, BindingOrder::HighToLow);
+    //benchmark_dense_parallel::<Fr>(&mut criterion, 26, BindingOrder::HighToLow);
+    //
+    //benchmark_compact::<Fr>(&mut criterion, 22, BindingOrder::LowToHigh);
+    //benchmark_compact::<Fr>(&mut criterion, 24, BindingOrder::LowToHigh);
+    //benchmark_compact::<Fr>(&mut criterion, 26, BindingOrder::LowToHigh);
+    //
     criterion.final_summary();
 }
