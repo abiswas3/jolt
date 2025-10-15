@@ -15,7 +15,7 @@ fn bench_add(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let x = Fr::random(&mut rng);
-                    let ab: Vec<_> = (0..100)
+                    let ab: Vec<_> = (0..2)
                         .map(|_| {
                             (
                                 Mont254BitChallenge::random(&mut rng),
@@ -43,7 +43,7 @@ fn bench_add(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let x = Fr::random(&mut rng);
-                    let ab: Vec<_> = (0..100)
+                    let ab: Vec<_> = (0..2)
                         .map(|_| {
                             (
                                 MontU128Challenge::random(&mut rng),
