@@ -571,20 +571,6 @@ impl<F: JoltField> PolynomialBinding<F> for MultilinearPolynomial<F> {
 
     #[tracing::instrument(skip_all, name = "MultilinearPolynomial::bind_parallel")]
     fn bind_parallel(&mut self, r: F::Challenge, order: BindingOrder) {
-        //match self {
-        //    MultilinearPolynomial::LargeScalars(poly) => {
-        //        println!("MLE BIND: {}", poly.len());
-        //        poly.bind(r, order)
-        //    }
-        //    MultilinearPolynomial::U9Scalars(poly) => poly.bind(r, order),
-        //    MultilinearPolynomial::U17Scalars(poly) => poly.bind(r, order),
-        //    MultilinearPolynomial::U33Scalars(poly) => poly.bind(r, order),
-        //    MultilinearPolynomial::U65Scalars(poly) => poly.bind(r, order),
-        //    MultilinearPolynomial::I65Scalars(poly) => poly.bind(r, order),
-        //    MultilinearPolynomial::I129Scalars(poly) => poly.bind(r, order),
-        //    MultilinearPolynomial::U129Scalars(poly) => poly.bind(r, order),
-        //    _ => unimplemented!("Unexpected MultilinearPolynomial variant"),
-        //}
         match self {
             MultilinearPolynomial::LargeScalars(poly) => poly.bind_parallel(r, order),
             MultilinearPolynomial::U8Scalars(poly) => poly.bind_parallel(r, order),
