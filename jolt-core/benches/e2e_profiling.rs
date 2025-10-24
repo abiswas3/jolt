@@ -44,7 +44,7 @@ pub fn benchmarks(bench_type: BenchType) -> Vec<(tracing::Span, Box<dyn FnOnce()
 }
 
 fn fibonacci() -> Vec<(tracing::Span, Box<dyn FnOnce()>)> {
-    prove_example("fibonacci-guest", postcard::to_stdvec(&400000u32).unwrap())
+    prove_example("fibonacci-guest", postcard::to_stdvec(&2u32).unwrap())
 }
 
 fn sha2() -> Vec<(tracing::Span, Box<dyn FnOnce()>)> {
@@ -203,6 +203,13 @@ fn prove_example(
     let (bytecode, init_memory_state, _) = program.decode();
     let (trace, _, program_io) = program.trace(&serialized_input, &[], &[]);
     let padded_trace_len = (trace.len() + 1).next_power_of_two();
+    //for (i, cycle) in trace.iter().enumerate() {
+    //    println!("Cycle {}: {:#?}", i, cycle);
+    //}
+    for (i, instr) in bytecode.iter().enumerate() {
+        println!("Instruction {}: {:#?}", i, instr);
+    }
+    std::process::exit(0);
     drop(trace);
 
     let task = move || {
