@@ -42,8 +42,11 @@ use tracer::instruction::Cycle;
 ///
 /// We define a "combined" left and right polynomial
 /// Left(x, y) = \sum_i L(y, i) * Left_i(x),
-/// Right(x, y) = \sum_i R(y, i) * Right_i(x),
+/// Right(x, y) = \sum_i L(y, i) * Right_i(x),
 /// where Left_i(x) = one of the five left polynomials, Right_i(x) = one of the five right polynomials
+/// Here x represents the a time cycle and y represents interpolation points for polynomials that
+/// pass through points (i, Left_i(x)) and (i, Right_i(x))
+/// L(y,i) denotes Lagrange_i(y).
 /// Indexing is over i \in {-2, -1, 0, 1, 2}, though this gets mapped to the 0th, 1st, ..., 4th polynomial
 ///
 /// We also need to define the combined claim:
@@ -184,6 +187,7 @@ impl<F: JoltField> ProductVirtualUniSkipInstance<F> {
             0
         };
 
+        // TODO: check for cache consistenicies
         let extended_evals: [F; PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE] = (0..num_parallel_chunks)
             .into_par_iter()
             .map(|chunk_idx| {
