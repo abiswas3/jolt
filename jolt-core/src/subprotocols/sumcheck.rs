@@ -146,12 +146,13 @@ impl BatchedSumcheck {
             compressed_polys.push(compressed_poly);
         }
 
-        let max_num_rounds = sumcheck_instances
-            .iter()
-            .map(|sumcheck| sumcheck.num_rounds())
-            .max()
-            .unwrap();
-
+        // NOTE: (ari) Why are we computing this again?
+        //let max_num_rounds = sumcheck_instances
+        //    .iter()
+        //    .map(|sumcheck| sumcheck.num_rounds())
+        //    .max()
+        //    .unwrap();
+        //
         for sumcheck in sumcheck_instances.iter() {
             // If a sumcheck instance has fewer than `max_num_rounds`,
             // we wait until there are <= `sumcheck.num_rounds()` left
