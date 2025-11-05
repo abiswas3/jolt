@@ -1,7 +1,7 @@
 use allocative::Allocative;
 use ark_std::Zero;
 
-use crate::field::{AccumulateInPlace, JoltField};
+use crate::field::{FMAdd, JoltField, MontgomeryReduce};
 use crate::poly::commitment::commitment_scheme::CommitmentScheme;
 use crate::poly::dense_mlpoly::DensePolynomial;
 use crate::poly::eq_poly::EqPolynomial;
@@ -28,9 +28,8 @@ use crate::utils::profiling::print_data_structure_heap_usage;
 use crate::utils::thread::unsafe_allocate_zero_vec;
 use crate::zkvm::dag::state_manager::StateManager;
 use crate::zkvm::instruction::{CircuitFlags, InstructionFlags};
-use crate::zkvm::r1cs::inputs::{
-    compute_claimed_product_factor_evals, ProductCycleInputs, PRODUCT_UNIQUE_FACTOR_VIRTUALS,
-};
+use crate::zkvm::r1cs::evaluation::ProductVirtualEval;
+use crate::zkvm::r1cs::inputs::{ProductCycleInputs, PRODUCT_UNIQUE_FACTOR_VIRTUALS};
 use crate::zkvm::witness::VirtualPolynomial;
 use crate::zkvm::JoltSharedPreprocessing;
 use ark_ff::biginteger::S128;
@@ -89,22 +88,23 @@ const PRODUCT_VIRTUAL_REMAINDER_DEGREE: usize = 3;
 
 /// Uni-skip instance for product virtualization, computing the first-round polynomial only.
 #[derive(Allocative)]
-pub struct ProductVirtualUniSkipInstance<F: JoltField> {
+pub struct ProductVirtualUniSkipInstanceProver<F: JoltField> {
     /// Evaluations of t1(Z) at the extended univariate-skip targets (outside base window)
     extended_evals: [F; PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE],
     #[allocative(skip)]
     params: ProductVirtualUniSkipInstanceParams<F>,
 }
 
-impl<F: JoltField> ProductVirtualUniSkipInstance<F> {
+impl<F: JoltField> ProductVirtualUniSkipInstanceProver<F> {
     /// Initialize a new prover for the univariate skip round
     /// The 5 base evaluations are the claimed evaluations of the 5 product terms from Spartan outer
-    #[tracing::instrument(skip_all, name = "ProductVirtualUniSkipInstance::new_prover")]
-    pub fn new_prover<ProofTranscript: Transcript, PCS: CommitmentScheme<Field = F>>(
-        state_manager: &mut StateManager<'_, F, ProofTranscript, PCS>,
+    #[tracing::instrument(skip_all, name = "ProductVirtualUniSkipInstanceProver::gen")]
+    pub fn gen<PCS: CommitmentScheme<Field = F>>(
+        state_manager: &mut StateManager<'_, F, PCS>,
+        opening_accumulator: &ProverOpeningAccumulator<F>,
         tau: &[F::Challenge],
     ) -> Self {
-        let params = ProductVirtualUniSkipInstanceParams::new(state_manager, tau);
+        let params = ProductVirtualUniSkipInstanceParams::new(opening_accumulator, tau);
 
         let (_, _, trace, _, _) = state_manager.get_prover_data();
 
@@ -200,7 +200,7 @@ impl<F: JoltField> ProductVirtualUniSkipInstance<F> {
                     let e_out = E_out[x_out_val];
                     // Accumulate across x_in using 8-limb signed accumulators per j
                     let mut inner_acc: [Acc8S<F>; PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE] =
-                        [Acc8S::<F>::new(); PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE];
+                        [Acc8S::<F>::zero(); PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE];
                     for x_in_val in 0..num_x_in_vals {
                         let e_in = if num_x_in_vals == 1 {
                             E_in[0]
@@ -274,7 +274,7 @@ impl<F: JoltField> ProductVirtualUniSkipInstance<F> {
                     // Reduce inner accumulators (pos-neg Montgomery) and multiply by E_out
                     // NOTE: needs a R^2 correction factor, applied when initializing E_out
                     for j in 0..PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DEGREE {
-                        let reduced = inner_acc[j].reduce();
+                        let reduced = inner_acc[j].montgomery_reduce();
                         local_acc_unr[j] += e_out.mul_unreduced::<9>(reduced);
                     }
                 }
@@ -302,11 +302,8 @@ impl<F: JoltField> ProductVirtualUniSkipInstance<F> {
 }
 
 impl<F: JoltField, T: Transcript> UniSkipFirstRoundInstanceProver<F, T>
-    for ProductVirtualUniSkipInstance<F>
+    for ProductVirtualUniSkipInstanceProver<F>
 {
-    const DEGREE_BOUND: usize = PRODUCT_VIRTUAL_FIRST_ROUND_POLY_NUM_COEFFS - 1;
-    const DOMAIN_SIZE: usize = NUM_PRODUCT_VIRTUAL;
-
     fn input_claim(&self) -> F {
         self.params.input_claim()
     }
@@ -340,14 +337,11 @@ pub struct ProductVirtualUniSkipInstanceParams<F: JoltField> {
 }
 
 impl<F: JoltField> ProductVirtualUniSkipInstanceParams<F> {
-    pub fn new(
-        state_manager: &mut StateManager<'_, F, impl Transcript, impl CommitmentScheme<Field = F>>,
-        tau: &[F::Challenge],
-    ) -> Self {
+    pub fn new(opening_accumulator: &dyn OpeningAccumulator<F>, tau: &[F::Challenge]) -> Self {
         let mut base_evals: [F; NUM_PRODUCT_VIRTUAL] = [F::zero(); NUM_PRODUCT_VIRTUAL];
         for (i, vp) in PRODUCT_VIRTUAL_TERMS.iter().enumerate() {
             let (_, eval) =
-                state_manager.get_virtual_polynomial_opening(*vp, SumcheckId::SpartanOuter);
+                opening_accumulator.get_virtual_polynomial_opening(*vp, SumcheckId::SpartanOuter);
             base_evals[i] = eval;
         }
         Self {
@@ -416,8 +410,8 @@ pub struct ProductVirtualRemainderProver<F: JoltField> {
 
 impl<F: JoltField> ProductVirtualRemainderProver<F> {
     #[tracing::instrument(skip_all, name = "ProductVirtualRemainderProver::gen")]
-    pub fn gen<ProofTranscript: Transcript, PCS: CommitmentScheme<Field = F>>(
-        state_manager: &mut StateManager<'_, F, ProofTranscript, PCS>,
+    pub fn gen<PCS: CommitmentScheme<Field = F>>(
+        state_manager: &mut StateManager<'_, F, PCS>,
         num_cycle_vars: usize,
         uni: &UniSkipState<F>,
     ) -> Self {
@@ -512,10 +506,14 @@ impl<F: JoltField> ProductVirtualRemainderProver<F> {
                         let row_lo = ProductCycleInputs::from_trace::<F>(trace, idx_lo);
                         let row_hi = ProductCycleInputs::from_trace::<F>(trace, idx_hi);
 
-                        let (left0, right0) =
-                            row_lo.compute_left_right_at_r::<F>(&weights_at_r0[..]);
-                        let (left1, right1) =
-                            row_hi.compute_left_right_at_r::<F>(&weights_at_r0[..]);
+                        let (left0, right0) = ProductVirtualEval::fused_left_right_at_r::<F>(
+                            &row_lo,
+                            &weights_at_r0[..],
+                        );
+                        let (left1, right1) = ProductVirtualEval::fused_left_right_at_r::<F>(
+                            &row_hi,
+                            &weights_at_r0[..],
+                        );
 
                         let e_in = if num_x_in_vals == 1 {
                             split_eq_poly.E_in_current()[0]
@@ -731,7 +729,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T>
         let (r_cycle, _r0_slice) = opening_point.r.split_at(self.params.n_cycle_vars);
 
         // Compute claimed unique factor evaluations at r_cycle in one pass
-        let claims = compute_claimed_product_factor_evals::<F>(&self.trace, r_cycle);
+        let claims = ProductVirtualEval::compute_claimed_factors::<F>(&self.trace, r_cycle);
 
         // Append fused left/right product openings akin to outer (SpartanAz/Bz)
         let lr = self.final_sumcheck_evals();
@@ -924,9 +922,10 @@ pub struct ProductVirtualInnerProver<F: JoltField> {
 impl<F: JoltField> ProductVirtualInnerProver<F> {
     #[tracing::instrument(skip_all, name = "ProductVirtualInnerProver::new")]
     pub fn new(
-        state_manager: &mut StateManager<'_, F, impl Transcript, impl CommitmentScheme<Field = F>>,
+        opening_accumulator: &ProverOpeningAccumulator<F>,
+        transcript: &mut impl Transcript,
     ) -> Self {
-        let params = ProductVirtualInnerParams::new(state_manager);
+        let params = ProductVirtualInnerParams::new(opening_accumulator, transcript);
         Self { params }
     }
 }
@@ -971,9 +970,10 @@ pub struct ProductVirtualInnerVerifier<F: JoltField> {
 
 impl<F: JoltField> ProductVirtualInnerVerifier<F> {
     pub fn new(
-        state_manager: &mut StateManager<'_, F, impl Transcript, impl CommitmentScheme<Field = F>>,
+        opening_accumulator: &VerifierOpeningAccumulator<F>,
+        transcript: &mut impl Transcript,
     ) -> Self {
-        let params = ProductVirtualInnerParams::new(state_manager);
+        let params = ProductVirtualInnerParams::new(opening_accumulator, transcript);
         Self { params }
     }
 }
@@ -1085,13 +1085,11 @@ struct ProductVirtualInnerParams<F: JoltField> {
 
 impl<F: JoltField> ProductVirtualInnerParams<F> {
     fn new(
-        state_manager: &mut StateManager<'_, F, impl Transcript, impl CommitmentScheme<Field = F>>,
+        opening_accumulator: &dyn OpeningAccumulator<F>,
+        transcript: &mut impl Transcript,
     ) -> Self {
-        let gamma = state_manager
-            .transcript
-            .borrow_mut()
-            .challenge_scalar_optimized::<F>();
-        let (pt_left, _) = state_manager.get_virtual_polynomial_opening(
+        let gamma = transcript.challenge_scalar_optimized::<F>();
+        let (pt_left, _) = opening_accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::FusedProductLeft,
             SumcheckId::ProductVirtualization,
         );
