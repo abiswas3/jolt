@@ -175,6 +175,7 @@ impl<F: JoltField> OuterUniSkipInstanceProver<F> {
         let iter_num_x_in_vars = num_x_in_vals.log_2();
         let iter_num_x_in_prime_vars = iter_num_x_in_vars - 1; // ignore last bit (group index)
 
+        //TODO: (ari) there could be cacche optimisations here.
         (0..num_parallel_chunks)
             .into_par_iter()
             .map(|chunk_idx| {
@@ -384,11 +385,16 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         let tau_high = uni.tau[uni.tau.len() - 1];
         let tau_low = &uni.tau[..uni.tau.len() - 1];
 
-        let lagrange_tau_r0 = LagrangePolynomial::<F>::lagrange_kernel::<
+        // compute eq(tau_hi, r0) where r0 is the challenge from first round
+        let lagrange_tau_r0: F = LagrangePolynomial::<F>::lagrange_kernel::<
             F::Challenge,
             UNIVARIATE_SKIP_DOMAIN_SIZE,
         >(&uni.r0, &tau_high);
 
+        // Note: tau_lo contains both time vars and group index
+        // the scaling factor simply multiplyes everyhing
+        // with \eq(tau_hi, r_0)
+        // internally this stores a Vec<F> of size 2^{\log T + 1}
         let split_eq_poly: GruenSplitEqPolynomial<F> =
             GruenSplitEqPolynomial::<F>::new_with_scaling(
                 tau_low,
@@ -465,6 +471,7 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         let mut bz_hi: Vec<F> = unsafe_allocate_zero_vec(groups_exact);
 
         // Parallel over x_out groups by mut-chunking all four buffers in lockstep
+        // TODO: (ari) check caching
         let (t0_acc_unr, t_inf_acc_unr) = az_lo
             .par_chunks_mut(num_x_in_vals)
             .zip(az_hi.par_chunks_mut(num_x_in_vals))
