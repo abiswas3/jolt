@@ -299,12 +299,13 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                 Some(lagrange_tau_r0),
             );
 
-        let (t0, t_inf, az_bound, bz_bound) = Self::compute_first_quadratic_evals_and_bound_polys(
-            &preprocessing.shared,
-            trace,
-            &lagrange_evals_r,
-            &split_eq_poly,
-        );
+        let (t0, t_inf, az_bound, bz_bound) =
+            Self::compute_first_quadratic_evals_and_bound_polys_new(
+                &preprocessing.shared,
+                trace,
+                &lagrange_evals_r,
+                &split_eq_poly,
+            );
 
         Self {
             split_eq_poly,
@@ -408,6 +409,142 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         )
     }
 
+    fn compute_first_quadratic_evals_and_bound_polys_new(
+        preprocess: &JoltSharedPreprocessing,
+        trace: &[Cycle],
+        lagrange_evals_r: &[F; OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE],
+        split_eq_poly: &GruenSplitEqPolynomial<F>,
+    ) -> (F, F, DensePolynomial<F>, DensePolynomial<F>) {
+        let num_x_out_vals = split_eq_poly.E_out_current_len();
+        let num_x_in_vals = split_eq_poly.E_in_current_len();
+        let iter_num_x_in_vars = num_x_in_vals.log_2();
+        let groups_exact = num_x_out_vals
+            .checked_mul(num_x_in_vals)
+            .expect("overflow computing groups_exact");
+
+        let mut az_bound: Vec<F> = unsafe_allocate_zero_vec(2 * groups_exact);
+        let mut bz_bound: Vec<F> = unsafe_allocate_zero_vec(2 * groups_exact);
+
+        const S_SIZE: usize = 1 << WINDOW_WIDTH; // 2^WINDOW_WIDTH
+
+        let (t0_acc_unr, t_inf_acc_unr, s) = az_bound
+            .par_chunks_exact_mut(2 * num_x_in_vals)
+            .zip(bz_bound.par_chunks_exact_mut(2 * num_x_in_vals))
+            .enumerate()
+            .fold(
+                || {
+                    (
+                        F::Unreduced::<9>::zero(),
+                        F::Unreduced::<9>::zero(),
+                        [F::Unreduced::<9>::zero(); S_SIZE], // S[group * 2 + x_in_bit0]
+                    )
+                },
+                |(mut acc0, mut acci, mut s_acc), (x_out_val, (az_chunk, bz_chunk))| {
+                    let mut inner_sum0 = F::Unreduced::<9>::zero();
+                    let mut inner_sum_inf = F::Unreduced::<9>::zero();
+
+                    for x_in_val in 0..num_x_in_vals {
+                        let x_in_bit0 = x_in_val & 1; // First bit of x_in
+
+                        let current_step_idx = (x_out_val << iter_num_x_in_vars) | x_in_val;
+                        let row_inputs =
+                            R1CSCycleInputs::from_trace::<F>(preprocess, trace, current_step_idx);
+                        let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
+
+                        let az0 = eval.az_at_r_first_group(lagrange_evals_r);
+                        let bz0 = eval.bz_at_r_first_group(lagrange_evals_r);
+                        let az1 = eval.az_at_r_second_group(lagrange_evals_r);
+                        let bz1 = eval.bz_at_r_second_group(lagrange_evals_r);
+
+                        let p0 = az0 * bz0;
+                        let p1 = az1 * bz1;
+                        let slope = (az1 - az0) * (bz1 - bz0);
+
+                        let e_in = split_eq_poly.E_in_current()[x_in_val];
+                        let e_out = split_eq_poly.E_out_current()[x_out_val];
+                        let eq_weight = e_in * e_out;
+
+                        // Accumulate products into S (indexed by group * 2 + x_in_bit0)
+                        s_acc[0 * 2 + x_in_bit0] += eq_weight.mul_unreduced::<9>(p0);
+                        s_acc[1 * 2 + x_in_bit0] += eq_weight.mul_unreduced::<9>(p1);
+
+                        inner_sum0 += e_in.mul_unreduced::<9>(p0);
+                        inner_sum_inf += e_in.mul_unreduced::<9>(slope);
+
+                        let off = 2 * x_in_val;
+                        az_chunk[off] = az0;
+                        az_chunk[off + 1] = az1;
+                        bz_chunk[off] = bz0;
+                        bz_chunk[off + 1] = bz1;
+                    }
+
+                    let e_out = split_eq_poly.E_out_current()[x_out_val];
+                    let reduced0 = F::from_montgomery_reduce::<9>(inner_sum0);
+                    let reduced_inf = F::from_montgomery_reduce::<9>(inner_sum_inf);
+                    acc0 += e_out.mul_unreduced::<9>(reduced0);
+                    acci += e_out.mul_unreduced::<9>(reduced_inf);
+
+                    (acc0, acci, s_acc)
+                },
+            )
+            .reduce(
+                || {
+                    (
+                        F::Unreduced::<9>::zero(),
+                        F::Unreduced::<9>::zero(),
+                        [F::Unreduced::<9>::zero(); S_SIZE],
+                    )
+                },
+                |(a0, ai, mut s1), (b0, bi, s2)| {
+                    for i in 0..S_SIZE {
+                        s1[i] += s2[i];
+                    }
+                    (a0 + b0, ai + bi, s1)
+                },
+            );
+
+        // Reduce S
+        let mut s_reduced = [F::zero(); S_SIZE];
+        for i in 0..S_SIZE {
+            s_reduced[i] = F::from_montgomery_reduce::<9>(s[i]);
+        }
+
+        // Verify s_reduced by recomputing from az_bound and bz_bound
+        let mut s_verify = [F::zero(); S_SIZE];
+        for x_out_val in 0..num_x_out_vals {
+            for x_in_val in 0..num_x_in_vals {
+                let x_in_bit0 = x_in_val & 1;
+                let e_in = split_eq_poly.E_in_current()[x_in_val];
+                let e_out = split_eq_poly.E_out_current()[x_out_val];
+                let eq_weight = e_in * e_out;
+
+                let base_idx = x_out_val * (2 * num_x_in_vals) + 2 * x_in_val;
+
+                for group in 0..2 {
+                    let az = az_bound[base_idx + group];
+                    let bz = bz_bound[base_idx + group];
+                    s_verify[group * 2 + x_in_bit0] += eq_weight * az * bz;
+                }
+            }
+        }
+
+        // Assert S computed correctly
+        for i in 0..S_SIZE {
+            assert_eq!(s_reduced[i], s_verify[i], "S[{}] mismatch", i);
+        }
+
+        // Assert t_0 by marginalizing over x_in_bit0 only (keep group=0)
+        // t0 = S[0*2+0] + S[0*2+1] = S[0] + S[1]
+        let t0_from_window = s_reduced[0] + s_reduced[1];
+        assert_eq!(F::from_montgomery_reduce::<9>(t0_acc_unr), t0_from_window);
+
+        (
+            F::from_montgomery_reduce::<9>(t0_acc_unr),
+            F::from_montgomery_reduce::<9>(t_inf_acc_unr),
+            DensePolynomial::new(az_bound),
+            DensePolynomial::new(bz_bound),
+        )
+    }
     // No special binding path needed; az/bz hold interleaved [lo,hi] ready for binding
 
     /// Compute the polynomial for each of the remaining rounds, using the
