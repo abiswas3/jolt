@@ -215,6 +215,11 @@ impl<F: JoltField> DensePolynomial<F> {
         self.len = n;
     }
 
+    // NOTE: this is not used for expensive sumchecks right now
+    // so there's no need to try and get rid of the mem-swap and optimise
+    // against binding hi-to-lo.
+    // Unless we go over 100ms optimisations are not worth it.
+    // Currently the most expensive bind is 200 ish micro-seconds.
     pub fn bound_poly_var_bot_01_optimized(&mut self, r: &F::Challenge) {
         let n = self.len() / 2;
 

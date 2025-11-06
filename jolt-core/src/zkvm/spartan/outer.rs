@@ -48,6 +48,7 @@ use crate::zkvm::r1cs::inputs::JoltR1CSInputs;
 
 /// Degree bound of the sumcheck round polynomials for [`OuterRemainingSumcheckVerifier`].
 const OUTER_REMAINING_DEGREE_BOUND: usize = 3;
+const WINDOW_WIDTH: usize = 2;
 
 // Spartan Outer sumcheck
 // (with univariate-skip first round on Z, and no Cz term given all eq conditional constraints)
@@ -251,8 +252,10 @@ pub struct OuterRemainingSumcheckProver<F: JoltField> {
     #[allocative(skip)]
     trace: Arc<Vec<Cycle>>,
     split_eq_poly: GruenSplitEqPolynomial<F>,
-    az: DensePolynomial<F>,
-    bz: DensePolynomial<F>,
+    // We still have these but their sizes will change
+    az: Option<DensePolynomial<F>>,
+    bz: Option<DensePolynomial<F>>,
+    stream: Option<Vec<F>>,
     /// The first round evals (t0, t_inf) computed from a streaming pass over the trace
     first_round_evals: (F, F),
     #[allocative(skip)]
@@ -268,13 +271,16 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
     ) -> Self {
         let (preprocessing, _, trace, _program_io, _final_mem) = state_manager.get_prover_data();
 
+        let outer_params = OuterRemainingSumcheckParams::new(num_cycles_bits, uni);
+
+        // L_{-5}(r0) ,..., L_{4}(r0)
         let lagrange_evals_r = LagrangePolynomial::<F>::evals::<
             F::Challenge,
             OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE,
         >(&uni.r0);
 
-        let tau_high = uni.tau[uni.tau.len() - 1];
-        let tau_low = &uni.tau[..uni.tau.len() - 1];
+        let tau_high = uni.tau[uni.tau.len() - 1]; // r0 variable
+        let tau_low = &uni.tau[..uni.tau.len() - 1]; // includes group index
 
         // compute eq(tau_hi, r0) where r0 is the challenge from first round
         let lagrange_tau_r0: F = LagrangePolynomial::<F>::lagrange_kernel::<
@@ -304,38 +310,24 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
             split_eq_poly,
             preprocess: Arc::new(preprocessing.shared.clone()),
             trace: Arc::new(trace.to_vec()),
-            az: az_bound,
-            bz: bz_bound,
+            az: Some(az_bound),
+            bz: Some(bz_bound),
+            stream: None,
             first_round_evals: (t0, t_inf),
-            params: OuterRemainingSumcheckParams::new(num_cycles_bits, uni),
+            params: outer_params,
         }
     }
 
-    /// Compute the quadratic evaluations for the streaming round (right after univariate skip).
-    ///
-    /// This uses the streaming algorithm to compute the sum-check polynomial for the round
-    /// right after the univariate skip round.
-    ///
-    /// Recall that we need to compute
-    ///
-    /// `t_i(0) = \sum_{x_out} E_out[x_out] \sum_{x_in} E_in[x_in] *
-    ///       unbound_coeffs_a(x_out, x_in, 0, r) * unbound_coeffs_b(x_out, x_in, 0, r)`
-    ///
-    /// and
-    ///
-    /// `t_i(∞) = \sum_{x_out} E_out[x_out] \sum_{x_in} E_in[x_in] * (unbound_coeffs_a(x_out,
-    /// x_in, ∞, r) * unbound_coeffs_b(x_out, x_in, ∞, r))`
-    ///
-    /// Here the "_a,b" subscript indicates the coefficients of `unbound_coeffs` corresponding to
-    /// Az and Bz respectively. Note that we index with x_out being the MSB here.
-    ///
-    /// Importantly, since the eval at `r` is not cached, we will need to recompute it via another
-    /// sum
-    ///
-    /// `unbound_coeffs_{a,b}(x_out, x_in, {0,∞}, r) = \sum_{y in D} Lagrange(r, y) *
-    /// unbound_coeffs_{a,b}(x_out, x_in, {0,∞}, y)`
-    ///
-    /// (and the eval at ∞ is computed as (eval at 1) - (eval at 0))
+    /// Compute the window lenght give current round_idx
+    pub fn get_window_with(&self, round_idx: usize) -> usize {
+        round_idx
+    }
+
+    /// I need to recompute the trace -- This looks very similar to what I am currently doing.
+    pub fn re_compute_multivariate_polynomial(&self) -> (F, F) {
+        (F::zero(), F::zero())
+    }
+
     #[inline]
     fn compute_first_quadratic_evals_and_bound_polys(
         preprocess: &JoltSharedPreprocessing,
@@ -346,7 +338,6 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         let num_x_out_vals = split_eq_poly.E_out_current_len();
         let num_x_in_vals = split_eq_poly.E_in_current_len();
         let iter_num_x_in_vars = num_x_in_vals.log_2();
-
         let groups_exact = num_x_out_vals
             .checked_mul(num_x_in_vals)
             .expect("overflow computing groups_exact");
@@ -356,6 +347,8 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         let mut bz_bound: Vec<F> = unsafe_allocate_zero_vec(2 * groups_exact);
 
         // Parallel over x_out groups using exact-sized mutable chunks, with per-worker fold
+        // NOTE: The parallelism is only over the outer evals, and this prevents any false sharing.
+        // Each unit of work is simpy (2\sqrt{T}, 2\sqrt{T}).
         let (t0_acc_unr, t_inf_acc_unr) = az_bound
             .par_chunks_exact_mut(2 * num_x_in_vals)
             .zip(bz_bound.par_chunks_exact_mut(2 * num_x_in_vals))
@@ -366,15 +359,24 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                     let mut inner_sum0 = F::Unreduced::<9>::zero();
                     let mut inner_sum_inf = F::Unreduced::<9>::zero();
                     for x_in_val in 0..num_x_in_vals {
+                        // current_step_idx = (x_out_val || x_in_val)
                         let current_step_idx = (x_out_val << iter_num_x_in_vars) | x_in_val;
                         let row_inputs =
                             R1CSCycleInputs::from_trace::<F>(preprocess, trace, current_step_idx);
                         let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
+                        // This binds r0
                         let az0 = eval.az_at_r_first_group(lagrange_evals_r);
                         let bz0 = eval.bz_at_r_first_group(lagrange_evals_r);
                         let az1 = eval.az_at_r_second_group(lagrange_evals_r);
                         let bz1 = eval.bz_at_r_second_group(lagrange_evals_r);
                         let p0 = az0 * bz0;
+                        // Let A(x) and B(x) be the univariate polynomials the prover
+                        // needs to send in round 1 where x is group index variable.
+                        // A(x) = qx + p
+                        // B(x) = tx + s
+                        // A(x)B(x) = tq x^2 + (tp + sq)x + ps
+                        // The leading coeff is
+                        // A(1) - A(0) * B(1) - B(0) = (p + q - p) * (t + s - s) = tq
                         let slope = (az1 - az0) * (bz1 - bz0);
                         let e_in = split_eq_poly.E_in_current()[x_in_val];
                         inner_sum0 += e_in.mul_unreduced::<9>(p0);
@@ -427,18 +429,21 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
     fn remaining_quadratic_evals(&self) -> (F, F) {
         let eq_poly = &self.split_eq_poly;
 
-        let n = self.az.len();
-        debug_assert_eq!(n, self.bz.len());
+        let n = self.az.as_ref().expect("az should be initialized").len();
+        let az = self.az.as_ref().expect("az should be initialized");
+        let bz = self.bz.as_ref().expect("bz should be initialized");
+
+        debug_assert_eq!(n, bz.len());
         if eq_poly.E_in_current_len() == 1 {
             // groups are pairs (0,1)
             let groups = n / 2;
             let (t0_unr, tinf_unr) = (0..groups)
                 .into_par_iter()
                 .map(|g| {
-                    let az0 = self.az[2 * g];
-                    let az1 = self.az[2 * g + 1];
-                    let bz0 = self.bz[2 * g];
-                    let bz1 = self.bz[2 * g + 1];
+                    let az0 = az[2 * g];
+                    let az1 = az[2 * g + 1];
+                    let bz0 = bz[2 * g];
+                    let bz1 = bz[2 * g + 1];
                     let eq = eq_poly.E_out_current()[g];
                     let p0 = az0 * bz0;
                     let slope = (az1 - az0) * (bz1 - bz0);
@@ -465,10 +470,10 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                     let mut inner_inf_unr = F::Unreduced::<9>::zero();
                     for x1 in 0..x1_len {
                         let g = (x2 << num_x1_bits) | x1;
-                        let az0 = self.az[2 * g];
-                        let az1 = self.az[2 * g + 1];
-                        let bz0 = self.bz[2 * g];
-                        let bz1 = self.bz[2 * g + 1];
+                        let az0 = az[2 * g];
+                        let az1 = az[2 * g + 1];
+                        let bz0 = bz[2 * g];
+                        let bz1 = bz[2 * g + 1];
                         let e_in = eq_poly.E_in_current()[x1];
                         let p0 = az0 * bz0;
                         let slope = (az1 - az0) * (bz1 - bz0);
@@ -494,16 +499,11 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
     }
 
     pub fn final_sumcheck_evals(&self) -> [F; 2] {
-        let az0 = if !self.az.is_empty() {
-            self.az[0]
-        } else {
-            F::zero()
-        };
-        let bz0 = if !self.bz.is_empty() {
-            self.bz[0]
-        } else {
-            F::zero()
-        };
+        let az = self.az.as_ref().expect("az should be initialized");
+        let bz = self.bz.as_ref().expect("bz should be initialized");
+
+        let az0 = if !az.is_empty() { az[0] } else { F::zero() };
+        let bz0 = if !bz.is_empty() { bz[0] } else { F::zero() };
         [az0, bz0]
     }
 }
@@ -529,7 +529,23 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
         let (t0, t_inf) = if round == 0 {
             self.first_round_evals
         } else {
-            self.remaining_quadratic_evals()
+            if self.params.windows.contains(&round) {
+                println!("Start of window: {:?}", round);
+                self.remaining_quadratic_evals()
+            } else {
+                let last_window_start = *self.params.windows.last().unwrap();
+                let last_window_end = last_window_start + WINDOW_WIDTH - 2;
+                if round > last_window_end {
+                    println!("Linear sumcheck : {:?}", round);
+                    self.remaining_quadratic_evals()
+                } else {
+                    // Case 3: In-between
+                    println!("I am in the middle: {:?}", round);
+                    // Here I will re-compute S
+                    self.re_compute_multivariate_polynomial();
+                    self.remaining_quadratic_evals()
+                }
+            }
         };
         let evals = self
             .split_eq_poly
@@ -540,8 +556,18 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
     #[tracing::instrument(skip_all, name = "OuterRemainingSumcheckProver::bind")]
     fn bind(&mut self, r_j: F::Challenge, _round: usize) {
         rayon::join(
-            || self.az.bind_parallel(r_j, BindingOrder::LowToHigh),
-            || self.bz.bind_parallel(r_j, BindingOrder::LowToHigh),
+            || {
+                self.az
+                    .as_mut()
+                    .expect("az should be initialised")
+                    .bind_parallel(r_j, BindingOrder::LowToHigh)
+            },
+            || {
+                self.bz
+                    .as_mut()
+                    .expect("bz should be initialised")
+                    .bind_parallel(r_j, BindingOrder::LowToHigh)
+            },
         );
 
         // Bind eq_poly for next round
@@ -754,15 +780,24 @@ struct OuterRemainingSumcheckParams<F: JoltField> {
     r0_uniskip: F::Challenge,
     /// Claim after the univariate-skip first round, updated every round
     input_claim: F,
+    // windows
+    windows: Vec<usize>,
 }
 
 impl<F: JoltField> OuterRemainingSumcheckParams<F> {
     fn new(num_cycles_bits: usize, uni: &UniSkipState<F>) -> Self {
+        let first_half_end: usize = num_cycles_bits / 2;
+        let windows = (0..first_half_end)
+            .step_by(WINDOW_WIDTH)
+            .map(|i| i + 1) // Convert to 1-indexed
+            .collect();
+
         Self {
             num_cycles_bits,
             tau: uni.tau.clone(),
             r0_uniskip: uni.r0,
             input_claim: uni.claim_after_first,
+            windows,
         }
     }
 
