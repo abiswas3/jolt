@@ -449,8 +449,6 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                     let mut inner_sum_inf = F::Unreduced::<9>::zero();
 
                     for x_in_val in 0..num_x_in_vals {
-                        let x_in_bit0 = x_in_val & 1;
-
                         let current_step_idx = (x_out_val << iter_num_x_in_vars) | x_in_val;
                         let row_inputs =
                             R1CSCycleInputs::from_trace::<F>(preprocess, trace, current_step_idx);
@@ -467,6 +465,10 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
 
                         let e_in = split_eq_poly.E_in_current()[x_in_val];
                         let e_out = split_eq_poly.E_out_current()[x_out_val];
+
+                        // THIS only works for the first round because we know it'll come from
+                        // E_In
+                        let x_in_bit0 = x_in_val & 1;
                         let eq_weight = e_in * e_out;
 
                         s_acc[0 * 3 + x_in_bit0] += eq_weight.mul_unreduced::<9>(p0);
@@ -669,34 +671,14 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
             return (F::zero(), F::zero());
         }
 
-        let eq_poly = &self.split_eq_poly;
-        let num_vars = (current_size as f64).log(3.0).round() as usize;
-        let other_vars_size = 3_usize.pow((num_vars - 1) as u32);
+        (s_ext[0], s_ext[1])
 
-        // Apply E_out weights when marginalizing
-        let mut t0_unr = F::Unreduced::<9>::zero();
-        let mut t_inf_unr = F::Unreduced::<9>::zero();
-
-        for i in 0..other_vars_size {
-            // Get eq weight
-            let eq_weight = if num_vars == 1 {
-                eq_poly.E_out_current()[0] // Single variable case
-            } else {
-                eq_poly.E_in_current()[i] // Multiple variables
-            };
-
-            let val_0 = s_ext[i];
-            let val_inf = s_ext[2 * other_vars_size + i];
-
-            t0_unr += eq_weight.mul_unreduced::<9>(val_0);
-            t_inf_unr += eq_weight.mul_unreduced::<9>(val_inf);
-        }
-
-        (
-            F::from_montgomery_reduce::<9>(t0_unr),
-            F::from_montgomery_reduce::<9>(t_inf_unr),
-        )
+        //(
+        //    F::from_montgomery_reduce::<9>(t0_unr),
+        //    F::from_montgomery_reduce::<9>(t_inf_unr),
+        //)
     }
+
     fn bind_extended_grid(&mut self, r: F::Challenge) {
         let s_ext = self.s_reduced.as_ref().expect("s_reduced should exist");
         let current_size = s_ext.len();
@@ -709,22 +691,24 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         let new_size = 3_usize.pow((num_vars - 1) as u32);
         let mut new_s_ext = vec![F::zero(); new_size];
 
-        for new_idx in 0..new_size {
-            let idx_0 = new_idx;
-            let idx_1 = new_idx + new_size;
-            let idx_inf = new_idx + 2 * new_size;
+        // Bind the first variable
+        // For each value of the remaining variables (second_var_eval ∈ {0,1,∞})
+        for second_var_eval in 0..new_size {
+            let idx_0 = second_var_eval; // S(0, second_var_eval)
+            let idx_1 = second_var_eval + new_size; // S(1, second_var_eval)
+            let idx_inf = second_var_eval + 2 * new_size; // S(∞, second_var_eval)
 
             let val_0 = s_ext[idx_0];
             let val_1 = s_ext[idx_1];
             let val_inf = s_ext[idx_inf];
 
-            // f(r) = val_0 * (1-r) + val_1 * r + val_inf * r(r-1)
-            new_s_ext[new_idx] = val_0 * (F::one() - r) + val_1 * r + val_inf * r * (r - F::one());
+            // Interpolate: f(r) = val_0 * (1-r) + val_1 * r + val_inf * r(r-1)
+            new_s_ext[second_var_eval] =
+                val_0 * (F::one() - r) + val_1 * r + val_inf * r * (r - F::one());
         }
 
         self.s_reduced = Some(new_s_ext);
     }
-
     pub fn final_sumcheck_evals(&self) -> [F; 2] {
         let az = self.az.as_ref().expect("az should be initialized");
         let bz = self.bz.as_ref().expect("bz should be initialized");
@@ -754,7 +738,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
     )]
     fn compute_prover_message(&mut self, round: usize, previous_claim: F) -> Vec<F> {
         let (t0, t_inf) = if round == 0 {
-            self.first_round_evals
+            self.first_round_evals // This is working great
         } else {
             if self.params.windows.contains(&round) {
                 println!("Start of window: {:?}; recompute", round);
@@ -768,8 +752,9 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
                     self.remaining_quadratic_evals()
                 } else {
                     // Case 3: In-between
+                    // FIXME: BROKEN currently
                     println!("I am in the middle: {:?}", round);
-                    let (t0, t_inf) = self.remaining_quadratic_evals();
+                    let (t0, t_inf) = self.remaining_quadratic_evals(); // THis is the right
                     let (debug_0, debug_inf) = self.remaining_quadratic_evals_new();
                     println!("{:?}, {:?}", t0, debug_0);
                     println!("{:?}, {:?}", t_inf, debug_inf);
