@@ -255,7 +255,6 @@ pub struct OuterRemainingSumcheckProver<F: JoltField> {
     // We still have these but their sizes will change
     az: Option<DensePolynomial<F>>,
     bz: Option<DensePolynomial<F>>,
-    s_hypercube: Option<DensePolynomial<F>>,
     s_reduced: Option<Vec<F>>,
     /// The first round evals (t0, t_inf) computed from a streaming pass over the trace
     first_round_evals: (F, F),
@@ -300,7 +299,7 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                 Some(lagrange_tau_r0),
             );
 
-        let (t0, t_inf, az_bound, bz_bound, s_hypercube, s_reduced) =
+        let (t0, t_inf, az_bound, bz_bound, s_reduced) =
             Self::compute_first_quadratic_evals_and_bound_polys_new(
                 &preprocessing.shared,
                 trace,
@@ -312,10 +311,9 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
             split_eq_poly,
             preprocess: Arc::new(preprocessing.shared.clone()),
             trace: Arc::new(trace.to_vec()),
-            az: Some(az_bound),
-            bz: Some(bz_bound),
-            s_hypercube: Some(s_hypercube),
-            s_reduced: Some(s_reduced),
+            az: az_bound,
+            bz: bz_bound,
+            s_reduced,
             first_round_evals: (t0, t_inf),
             params: outer_params,
         }
@@ -419,10 +417,9 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
     ) -> (
         F,
         F,
-        DensePolynomial<F>,
-        DensePolynomial<F>,
-        DensePolynomial<F>,
-        Vec<F>,
+        Option<DensePolynomial<F>>,
+        Option<DensePolynomial<F>>,
+        Option<Vec<F>>,
     ) {
         let num_x_out_vals = split_eq_poly.E_out_current_len();
         let num_x_in_vals = split_eq_poly.E_in_current_len();
@@ -524,7 +521,6 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         // Marginalize to get t(0), t(1), t(∞)
         // t(X_group) = Σ_{x_in ∈ {0,1}} S(X_group, x_in)
         let t0_from_window = s_reduced[0 * 3 + 0] + s_reduced[0 * 3 + 1]; // S(0,0) + S(0,1)
-        let t1_from_window = s_reduced[1 * 3 + 0] + s_reduced[1 * 3 + 1]; // S(1,0) + S(1,1)
         let t_inf_from_window = s_reduced[2 * 3 + 0] + s_reduced[2 * 3 + 1]; // S(∞,0) + S(∞,1)
 
         // Assert t(0) and t(∞)
@@ -559,10 +555,9 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         (
             F::from_montgomery_reduce::<9>(t0_acc_unr),
             F::from_montgomery_reduce::<9>(t_inf_acc_unr),
-            DensePolynomial::new(az_bound),
-            DensePolynomial::new(bz_bound),
-            DensePolynomial::new(s_bool_hypercube),
-            s_reduced.to_vec(), // All 3^WINDOW_WIDTH extended evals
+            Some(DensePolynomial::new(az_bound)),
+            Some(DensePolynomial::new(bz_bound)),
+            Some(s_reduced.to_vec()), // All 3^WINDOW_WIDTH extended evals
         )
     }
     // No special binding path needed; az/bz hold interleaved [lo,hi] ready for binding
@@ -654,6 +649,70 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
             )
         }
     }
+    fn remaining_quadratic_evals_new(&mut self) -> (F, F) {
+        let s_ext = self.s_reduced.as_ref().expect("s_reduced should exist");
+        let current_size = s_ext.len();
+
+        if current_size == 1 {
+            println!("Handle S recomputation");
+            return (F::zero(), F::zero());
+        }
+
+        let eq_poly = &self.split_eq_poly;
+        let num_vars = (current_size as f64).log(3.0).round() as usize;
+        let other_vars_size = 3_usize.pow((num_vars - 1) as u32);
+
+        // Apply E_out weights when marginalizing
+        let mut t0_unr = F::Unreduced::<9>::zero();
+        let mut t_inf_unr = F::Unreduced::<9>::zero();
+
+        for i in 0..other_vars_size {
+            // Get eq weight
+            let eq_weight = if num_vars == 1 {
+                eq_poly.E_out_current()[0] // Single variable case
+            } else {
+                eq_poly.E_in_current()[i] // Multiple variables
+            };
+
+            let val_0 = s_ext[i];
+            let val_inf = s_ext[2 * other_vars_size + i];
+
+            t0_unr += eq_weight.mul_unreduced::<9>(val_0);
+            t_inf_unr += eq_weight.mul_unreduced::<9>(val_inf);
+        }
+
+        (
+            F::from_montgomery_reduce::<9>(t0_unr),
+            F::from_montgomery_reduce::<9>(t_inf_unr),
+        )
+    }
+    fn bind_extended_grid(&mut self, r: F::Challenge) {
+        let s_ext = self.s_reduced.as_ref().expect("s_reduced should exist");
+        let current_size = s_ext.len();
+        let num_vars = (current_size as f64).log(3.0).round() as usize;
+
+        if num_vars == 0 {
+            return; // Already fully bound
+        }
+
+        let new_size = 3_usize.pow((num_vars - 1) as u32);
+        let mut new_s_ext = vec![F::zero(); new_size];
+
+        for new_idx in 0..new_size {
+            let idx_0 = new_idx;
+            let idx_1 = new_idx + new_size;
+            let idx_inf = new_idx + 2 * new_size;
+
+            let val_0 = s_ext[idx_0];
+            let val_1 = s_ext[idx_1];
+            let val_inf = s_ext[idx_inf];
+
+            // f(r) = val_0 * (1-r) + val_1 * r + val_inf * r(r-1)
+            new_s_ext[new_idx] = val_0 * (F::one() - r) + val_1 * r + val_inf * r * (r - F::one());
+        }
+
+        self.s_reduced = Some(new_s_ext);
+    }
 
     pub fn final_sumcheck_evals(&self) -> [F; 2] {
         let az = self.az.as_ref().expect("az should be initialized");
@@ -687,20 +746,23 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
             self.first_round_evals
         } else {
             if self.params.windows.contains(&round) {
-                println!("Start of window: {:?}", round);
-                self.remaining_quadratic_evals()
+                println!("Start of window: {:?}; recompute", round);
+                let (t0, t_inf) = self.remaining_quadratic_evals();
+                (t0, t_inf)
             } else {
                 let last_window_start = *self.params.windows.last().unwrap();
                 let last_window_end = last_window_start + WINDOW_WIDTH - 2;
                 if round > last_window_end {
-                    println!("Linear sumcheck : {:?}", round);
+                    println!("Linear sumcheck : TODO! {:?}", round);
                     self.remaining_quadratic_evals()
                 } else {
                     // Case 3: In-between
                     println!("I am in the middle: {:?}", round);
-                    // Here I will re-compute S
-                    self.re_compute_multivariate_polynomial();
-                    self.remaining_quadratic_evals()
+                    let (t0, t_inf) = self.remaining_quadratic_evals();
+                    let (debug_0, debug_inf) = self.remaining_quadratic_evals_new();
+                    println!("{:?}, {:?}", t0, debug_0);
+                    println!("{:?}, {:?}", t_inf, debug_inf);
+                    (t0, t_inf)
                 }
             }
         };
@@ -726,6 +788,8 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
                     .bind_parallel(r_j, BindingOrder::LowToHigh)
             },
         );
+        // Bind the extended grid for S
+        self.bind_extended_grid(r_j);
 
         // Bind eq_poly for next round
         self.split_eq_poly.bind(r_j);
@@ -943,12 +1007,8 @@ struct OuterRemainingSumcheckParams<F: JoltField> {
 
 impl<F: JoltField> OuterRemainingSumcheckParams<F> {
     fn new(num_cycles_bits: usize, uni: &UniSkipState<F>) -> Self {
-        let first_half_end: usize = num_cycles_bits / 2;
-        let windows = (0..first_half_end)
-            .step_by(WINDOW_WIDTH)
-            .map(|i| i + 1) // Convert to 1-indexed
-            .collect();
-
+        let first_half_end: usize = (num_cycles_bits + 1) / 2;
+        let windows = (0..first_half_end).step_by(WINDOW_WIDTH).collect(); // Keep 0-indexed: [0, 2, 4, ...]
         Self {
             num_cycles_bits,
             tau: uni.tau.clone(),
@@ -957,7 +1017,6 @@ impl<F: JoltField> OuterRemainingSumcheckParams<F> {
             windows,
         }
     }
-
     fn num_rounds(&self) -> usize {
         1 + self.num_cycles_bits
     }
