@@ -562,8 +562,10 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         );
 
         (
-            F::from_montgomery_reduce::<9>(t0_acc_unr),
-            F::from_montgomery_reduce::<9>(t_inf_acc_unr),
+            //F::from_montgomery_reduce::<9>(t0_acc_unr),
+            t0_from_window,
+            //F::from_montgomery_reduce::<9>(t_inf_acc_unr),
+            t_inf_from_window,
             Some(DensePolynomial::new(az_bound)),
             Some(DensePolynomial::new(bz_bound)),
             Some(s_reduced.to_vec()),
