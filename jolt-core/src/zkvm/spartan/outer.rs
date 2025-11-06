@@ -255,7 +255,8 @@ pub struct OuterRemainingSumcheckProver<F: JoltField> {
     // We still have these but their sizes will change
     az: Option<DensePolynomial<F>>,
     bz: Option<DensePolynomial<F>>,
-    stream: Option<Vec<F>>,
+    s_hypercube: Option<DensePolynomial<F>>,
+    s_reduced: Option<Vec<F>>,
     /// The first round evals (t0, t_inf) computed from a streaming pass over the trace
     first_round_evals: (F, F),
     #[allocative(skip)]
@@ -299,7 +300,7 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                 Some(lagrange_tau_r0),
             );
 
-        let (t0, t_inf, az_bound, bz_bound) =
+        let (t0, t_inf, az_bound, bz_bound, s_hypercube, s_reduced) =
             Self::compute_first_quadratic_evals_and_bound_polys_new(
                 &preprocessing.shared,
                 trace,
@@ -313,7 +314,8 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
             trace: Arc::new(trace.to_vec()),
             az: Some(az_bound),
             bz: Some(bz_bound),
-            stream: None,
+            s_hypercube: Some(s_hypercube),
+            s_reduced: Some(s_reduced),
             first_round_evals: (t0, t_inf),
             params: outer_params,
         }
@@ -330,7 +332,7 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
     }
 
     #[inline]
-    fn compute_first_quadratic_evals_and_bound_polys(
+    fn _compute_first_quadratic_evals_and_bound_polys(
         preprocess: &JoltSharedPreprocessing,
         trace: &[Cycle],
         lagrange_evals_r: &[F; OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE],
@@ -414,7 +416,14 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         trace: &[Cycle],
         lagrange_evals_r: &[F; OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE],
         split_eq_poly: &GruenSplitEqPolynomial<F>,
-    ) -> (F, F, DensePolynomial<F>, DensePolynomial<F>) {
+    ) -> (
+        F,
+        F,
+        DensePolynomial<F>,
+        DensePolynomial<F>,
+        DensePolynomial<F>,
+        Vec<F>,
+    ) {
         let num_x_out_vals = split_eq_poly.E_out_current_len();
         let num_x_in_vals = split_eq_poly.E_in_current_len();
         let iter_num_x_in_vars = num_x_in_vals.log_2();
@@ -425,7 +434,7 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         let mut az_bound: Vec<F> = unsafe_allocate_zero_vec(2 * groups_exact);
         let mut bz_bound: Vec<F> = unsafe_allocate_zero_vec(2 * groups_exact);
 
-        const S_SIZE: usize = 1 << WINDOW_WIDTH; // 2^WINDOW_WIDTH
+        const S_SIZE: usize = 3_usize.pow(WINDOW_WIDTH as u32); // 3^WINDOW_WIDTH = 9
 
         let (t0_acc_unr, t_inf_acc_unr, s) = az_bound
             .par_chunks_exact_mut(2 * num_x_in_vals)
@@ -436,7 +445,7 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                     (
                         F::Unreduced::<9>::zero(),
                         F::Unreduced::<9>::zero(),
-                        [F::Unreduced::<9>::zero(); S_SIZE], // S[group * 2 + x_in_bit0]
+                        [F::Unreduced::<9>::zero(); S_SIZE], // S on {0,1,∞}^2 grid
                     )
                 },
                 |(mut acc0, mut acci, mut s_acc), (x_out_val, (az_chunk, bz_chunk))| {
@@ -456,20 +465,23 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                         let az1 = eval.az_at_r_second_group(lagrange_evals_r);
                         let bz1 = eval.bz_at_r_second_group(lagrange_evals_r);
 
-                        let p0 = az0 * bz0;
-                        let p1 = az1 * bz1;
-                        let slope = (az1 - az0) * (bz1 - bz0);
+                        let p0 = az0 * bz0; // S(group=0, x_in_bit0)
+                        let p1 = az1 * bz1; // S(group=1, x_in_bit0)
+                        let p_inf = (az1 - az0) * (bz1 - bz0); // S(group=∞, x_in_bit0)
 
                         let e_in = split_eq_poly.E_in_current()[x_in_val];
                         let e_out = split_eq_poly.E_out_current()[x_out_val];
                         let eq_weight = e_in * e_out;
 
-                        // Accumulate products into S (indexed by group * 2 + x_in_bit0)
-                        s_acc[0 * 2 + x_in_bit0] += eq_weight.mul_unreduced::<9>(p0);
-                        s_acc[1 * 2 + x_in_bit0] += eq_weight.mul_unreduced::<9>(p1);
+                        // Accumulate into S on {0,1,∞} × {0,1} grid
+                        // Index: group_eval * 3 + x_in_eval
+                        // For now, x_in_eval is just 0 or 1 (we'll handle ∞ separately)
+                        s_acc[0 * 3 + x_in_bit0] += eq_weight.mul_unreduced::<9>(p0);
+                        s_acc[1 * 3 + x_in_bit0] += eq_weight.mul_unreduced::<9>(p1);
+                        s_acc[2 * 3 + x_in_bit0] += eq_weight.mul_unreduced::<9>(p_inf);
 
                         inner_sum0 += e_in.mul_unreduced::<9>(p0);
-                        inner_sum_inf += e_in.mul_unreduced::<9>(slope);
+                        inner_sum_inf += e_in.mul_unreduced::<9>(p_inf);
 
                         let off = 2 * x_in_val;
                         az_chunk[off] = az0;
@@ -509,40 +521,48 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
             s_reduced[i] = F::from_montgomery_reduce::<9>(s[i]);
         }
 
-        // Verify s_reduced by recomputing from az_bound and bz_bound
-        let mut s_verify = [F::zero(); S_SIZE];
-        for x_out_val in 0..num_x_out_vals {
-            for x_in_val in 0..num_x_in_vals {
-                let x_in_bit0 = x_in_val & 1;
-                let e_in = split_eq_poly.E_in_current()[x_in_val];
-                let e_out = split_eq_poly.E_out_current()[x_out_val];
-                let eq_weight = e_in * e_out;
+        // Marginalize to get t(0), t(1), t(∞)
+        // t(X_group) = Σ_{x_in ∈ {0,1}} S(X_group, x_in)
+        let t0_from_window = s_reduced[0 * 3 + 0] + s_reduced[0 * 3 + 1]; // S(0,0) + S(0,1)
+        let t1_from_window = s_reduced[1 * 3 + 0] + s_reduced[1 * 3 + 1]; // S(1,0) + S(1,1)
+        let t_inf_from_window = s_reduced[2 * 3 + 0] + s_reduced[2 * 3 + 1]; // S(∞,0) + S(∞,1)
 
-                let base_idx = x_out_val * (2 * num_x_in_vals) + 2 * x_in_val;
+        // Assert t(0) and t(∞)
+        assert_eq!(
+            F::from_montgomery_reduce::<9>(t0_acc_unr),
+            t0_from_window,
+            "t0 mismatch"
+        );
+        assert_eq!(
+            F::from_montgomery_reduce::<9>(t_inf_acc_unr),
+            t_inf_from_window,
+            "t_inf mismatch"
+        );
+        // Extract boolean hypercube evaluations for DensePolynomial
+        // For {0,1}^WINDOW_WIDTH, we need 2^WINDOW_WIDTH values
+        let bool_hypercube_size = 1 << WINDOW_WIDTH; // 2^WINDOW_WIDTH
+        let mut s_bool_hypercube = Vec::with_capacity(bool_hypercube_size);
 
-                for group in 0..2 {
-                    let az = az_bound[base_idx + group];
-                    let bz = bz_bound[base_idx + group];
-                    s_verify[group * 2 + x_in_bit0] += eq_weight * az * bz;
-                }
+        for bool_index in 0..bool_hypercube_size {
+            // Convert boolean index to extended grid index
+            // Each variable can be 0 or 1 in boolean hypercube
+            // In extended grid with base 3: index = sum(bit_i * 3^i)
+            let mut extended_index = 0;
+            let mut temp = bool_index;
+            for pos in 0..WINDOW_WIDTH {
+                let bit = temp & 1;
+                extended_index += bit * 3_usize.pow(pos as u32);
+                temp >>= 1;
             }
+            s_bool_hypercube.push(s_reduced[extended_index]);
         }
-
-        // Assert S computed correctly
-        for i in 0..S_SIZE {
-            assert_eq!(s_reduced[i], s_verify[i], "S[{}] mismatch", i);
-        }
-
-        // Assert t_0 by marginalizing over x_in_bit0 only (keep group=0)
-        // t0 = S[0*2+0] + S[0*2+1] = S[0] + S[1]
-        let t0_from_window = s_reduced[0] + s_reduced[1];
-        assert_eq!(F::from_montgomery_reduce::<9>(t0_acc_unr), t0_from_window);
-
         (
             F::from_montgomery_reduce::<9>(t0_acc_unr),
             F::from_montgomery_reduce::<9>(t_inf_acc_unr),
             DensePolynomial::new(az_bound),
             DensePolynomial::new(bz_bound),
+            DensePolynomial::new(s_bool_hypercube),
+            s_reduced.to_vec(), // All 3^WINDOW_WIDTH extended evals
         )
     }
     // No special binding path needed; az/bz hold interleaved [lo,hi] ready for binding
