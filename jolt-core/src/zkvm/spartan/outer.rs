@@ -1,5 +1,6 @@
 use allocative::Allocative;
 use ark_std::Zero;
+use jolt_platform::print;
 use rayon::prelude::*;
 use std::sync::Arc;
 use tracer::instruction::Cycle;
@@ -15,6 +16,7 @@ use crate::poly::opening_proof::{
     VerifierOpeningAccumulator, BIG_ENDIAN, LITTLE_ENDIAN,
 };
 use crate::poly::split_eq_poly::GruenSplitEqPolynomial;
+use crate::poly::split_eq_poly_generalised::GruenSplitEqPolynomialGeneral;
 use crate::poly::unipoly::UniPoly;
 use crate::subprotocols::sumcheck_prover::{
     SumcheckInstanceProver, UniSkipFirstRoundInstanceProver,
@@ -49,6 +51,7 @@ use crate::zkvm::r1cs::inputs::JoltR1CSInputs;
 /// Degree bound of the sumcheck round polynomials for [`OuterRemainingSumcheckVerifier`].
 const OUTER_REMAINING_DEGREE_BOUND: usize = 3;
 const WINDOW_WIDTH: usize = 2;
+const INFINITY: u32 = 2; // 2 represents ∞ in base-3
 
 // Spartan Outer sumcheck
 // (with univariate-skip first round on Z, and no Cz term given all eq conditional constraints)
@@ -252,6 +255,7 @@ pub struct OuterRemainingSumcheckProver<F: JoltField> {
     #[allocative(skip)]
     trace: Arc<Vec<Cycle>>,
     split_eq_poly: GruenSplitEqPolynomial<F>,
+    split_eq_poly_gen: GruenSplitEqPolynomialGeneral<F>,
     // We still have these but their sizes will change
     az: Option<DensePolynomial<F>>,
     bz: Option<DensePolynomial<F>>,
@@ -260,6 +264,7 @@ pub struct OuterRemainingSumcheckProver<F: JoltField> {
     first_round_evals: (F, F),
     #[allocative(skip)]
     params: OuterRemainingSumcheckParams<F>,
+    lagrange_evals_r0: [F; 10],
 }
 
 impl<F: JoltField> OuterRemainingSumcheckProver<F> {
@@ -299,23 +304,32 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                 Some(lagrange_tau_r0),
             );
 
-        let (t0, t_inf, az_bound, bz_bound, s_reduced) =
-            Self::compute_first_quadratic_evals_and_bound_polys_new(
-                &preprocessing.shared,
-                trace,
-                &lagrange_evals_r,
-                &split_eq_poly,
+        let split_eq_poly_gen: GruenSplitEqPolynomialGeneral<F> =
+            GruenSplitEqPolynomialGeneral::<F>::new_with_scaling(
+                tau_low,
+                BindingOrder::LowToHigh,
+                Some(lagrange_tau_r0),
+                WINDOW_WIDTH,
             );
+
+        let (t0, t_inf, az_bound, bz_bound) = Self::compute_first_quadratic_evals_and_bound_polys(
+            &preprocessing.shared,
+            trace,
+            &lagrange_evals_r,
+            &split_eq_poly,
+        );
 
         Self {
             split_eq_poly,
+            split_eq_poly_gen,
             preprocess: Arc::new(preprocessing.shared.clone()),
             trace: Arc::new(trace.to_vec()),
-            az: az_bound,
-            bz: bz_bound,
-            s_reduced,
+            az: Some(az_bound), // TB deleted
+            bz: Some(bz_bound), // To be deleted
+            s_reduced: None,
             first_round_evals: (t0, t_inf),
             params: outer_params,
+            lagrange_evals_r0: lagrange_evals_r,
         }
     }
 
@@ -324,13 +338,167 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         round_idx
     }
 
-    /// I need to recompute the trace -- This looks very similar to what I am currently doing.
-    pub fn re_compute_multivariate_polynomial(&self) -> (F, F) {
-        (F::zero(), F::zero())
+    fn digitize(&self, mut i: usize, b: usize, digits: usize) -> Vec<u32> {
+        let mut ans = vec![0u32; digits];
+        for idx in (0..digits).rev() {
+            ans[idx] = (i % b) as u32;
+            i /= b;
+        }
+        ans
     }
 
-    #[inline]
-    fn _compute_first_quadratic_evals_and_bound_polys(
+    /// returns the grid of evaluations on 3^window_size
+    fn get_grid_aux(
+        &self,
+        split_eq_poly: &GruenSplitEqPolynomialGeneral<F>,
+        window_size: usize,
+        preprocess: &JoltSharedPreprocessing,
+        trace: &[Cycle],
+        lagrange_evals_r: &[F; OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE],
+    ) -> Vec<F> {
+        let num_x_out_vals = split_eq_poly.E_out_current_len();
+        let num_x_in_vals = split_eq_poly.E_in_current_len();
+        let num_x_in_vars = num_x_in_vals.log_2();
+        let num_x_out_vars = num_x_out_vals.log_2();
+
+        let num_rs = split_eq_poly.num_challenges();
+        let num_active_evals = (0..window_size).fold(1, |acc, _| acc * 3);
+        let mut ans: Vec<F> = vec![F::zero(); num_active_evals];
+
+        for a_idx in 0..num_active_evals {
+            let z_vec = self.digitize(a_idx, 3, window_size);
+            let mut accumulator = F::zero(); // Unreduced accumulator
+            for (out_idx, out_val) in split_eq_poly.E_out_current().iter().enumerate() {
+                let x_out_vec = self.digitize(out_idx, 2, num_x_out_vals);
+                for (in_idx, in_val) in split_eq_poly.E_in_current().iter().enumerate() {
+                    let x_in_vec = self.digitize(in_idx, 2, num_x_in_vars);
+
+                    for r_idx in 0..split_eq_poly.num_challenges().max(1) {
+                        let r_vec = if split_eq_poly.num_challenges() > 0 {
+                            self.digitize(r_idx, 2, split_eq_poly.num_challenges())
+                        } else {
+                            vec![] // Empty vec when no challenges
+                        };
+                        // a_idx is a 3^windown size
+                        // time_step_idx = out_idx_in_bits || in_idx_bits || a_idx_in_bits ||
+                        // r_idx_in_bits
+                        let mut inf_indices: Vec<usize> = Vec::new();
+                        for z_idx in 0..z_vec.len() {
+                            if z_vec[z_idx] == 2 {
+                                inf_indices.push(z_idx);
+                            }
+                        }
+
+                        let num_infs = inf_indices.len();
+                        let mut A_mess = F::zero();
+                        let mut B_mess = F::zero();
+                        for f_in in 0..(1 << num_infs) {
+                            let f_vec = self.digitize(f_in, 2, num_infs);
+                            let mut new_z_vec = Vec::new();
+                            let mut curr_f_index = 0;
+                            for z_in in 0..z_vec.len() {
+                                if z_vec[z_in] == INFINITY {
+                                    new_z_vec.push(f_vec[curr_f_index]);
+                                    curr_f_index += 1;
+                                } else {
+                                    new_z_vec.push(z_vec[z_in]);
+                                }
+                            }
+
+                            let (index_vec, selector) = if split_eq_poly.num_challenges() > 0 {
+                                // Concatenate: x_out_vec || x_in_vec || new_z_vec || r_vec[1:]
+                                let mut idx_vec = Vec::new();
+                                idx_vec.extend_from_slice(&x_out_vec);
+                                idx_vec.extend_from_slice(&x_in_vec);
+                                idx_vec.extend_from_slice(&new_z_vec);
+                                idx_vec.extend_from_slice(&r_vec[1..]);
+                                if r_vec[0] == 0 {
+                                    (idx_vec, false)
+                                } else {
+                                    (idx_vec, true)
+                                }
+                            } else {
+                                // Concatenate: x_out_vec || x_in_vec || new_z_vec[1:]
+                                let mut idx_vec = Vec::new();
+                                idx_vec.extend_from_slice(&x_out_vec);
+                                idx_vec.extend_from_slice(&x_in_vec);
+                                idx_vec.extend_from_slice(&new_z_vec[1..]);
+
+                                if new_z_vec[0] == 0 {
+                                    (idx_vec, false)
+                                } else {
+                                    (idx_vec, true)
+                                }
+                            };
+
+                            // Convert binary vector to single index
+                            let current_step_idx = index_vec
+                                .iter()
+                                .fold(0usize, |acc, &bit| (acc << 1) | (bit as usize));
+
+                            let (az, bz) = self.get_az_bz_at_curr_timestep(
+                                current_step_idx,
+                                selector,
+                                preprocess,
+                                trace,
+                                lagrange_evals_r,
+                            );
+                            //println!("Current time idx: {current_step_idx} Selector: {selector}");
+                            //println!("Az: {:?}", az);
+                            let num_zeros = f_vec.iter().filter(|&&v| v == 0).count();
+                            if num_zeros % 2 == 0 {
+                                // Positive contribution
+                                A_mess = A_mess + az;
+                                B_mess = B_mess + bz;
+                            } else {
+                                // Negative contribution
+                                A_mess = A_mess - az;
+                                B_mess = B_mess - bz;
+                            }
+                        }
+
+                        // Also need to handle eq polynomial for r if there are challenges
+                        let eq_r = if split_eq_poly.num_challenges() > 0 {
+                            // Compute eq(r_vec, challenges)
+                            //self.eq(&r_vec, split_eq_poly.get_challenges())
+                            todo!("hAndle the binding business")
+                        } else {
+                            F::one()
+                        };
+
+                        let product = A_mess * B_mess * eq_r * out_val * in_val;
+                        accumulator = accumulator + product;
+                    }
+                }
+            }
+            ans[a_idx] = accumulator;
+        }
+        ans
+    }
+
+    fn get_az_bz_at_curr_timestep(
+        &self,
+        current_step_idx: usize,
+        selector: bool,
+        preprocess: &JoltSharedPreprocessing,
+        trace: &[Cycle],
+        lagrange_evals_r: &[F; OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE],
+    ) -> (F, F) {
+        let row_inputs = R1CSCycleInputs::from_trace::<F>(preprocess, trace, current_step_idx);
+        let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
+        // This binds r0
+        if !selector {
+            let az0 = eval.az_at_r_first_group(lagrange_evals_r);
+            let bz0 = eval.bz_at_r_first_group(lagrange_evals_r);
+            (az0, bz0)
+        } else {
+            let az1 = eval.az_at_r_second_group(lagrange_evals_r);
+            let bz1 = eval.bz_at_r_second_group(lagrange_evals_r);
+            (az1, bz1)
+        }
+    }
+
+    fn compute_first_quadratic_evals_and_bound_polys(
         preprocess: &JoltSharedPreprocessing,
         trace: &[Cycle],
         lagrange_evals_r: &[F; OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE],
@@ -351,6 +519,7 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         // NOTE: The parallelism is only over the outer evals, and this prevents any false sharing.
         // Each unit of work is simpy (2\sqrt{T}, 2\sqrt{T}).
         let (t0_acc_unr, t_inf_acc_unr) = az_bound
+            //.par_chunks_exact_mut(2 * num_x_in_vals)
             .par_chunks_exact_mut(2 * num_x_in_vals)
             .zip(bz_bound.par_chunks_exact_mut(2 * num_x_in_vals))
             .enumerate()
@@ -377,7 +546,7 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                         // B(x) = tx + s
                         // A(x)B(x) = tq x^2 + (tp + sq)x + ps
                         // The leading coeff is
-                        // A(1) - A(0) * B(1) - B(0) = (p + q - p) * (t + s - s) = tq
+                        // A(inf)B(inf) = (A(1) - A(0)) * (B(1) - B(0)) = (p + q - p) * (t + s - s) = tq
                         let slope = (az1 - az0) * (bz1 - bz0);
                         let e_in = split_eq_poly.E_in_current()[x_in_val];
                         inner_sum0 += e_in.mul_unreduced::<9>(p0);
@@ -406,171 +575,6 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
             F::from_montgomery_reduce::<9>(t_inf_acc_unr),
             DensePolynomial::new(az_bound),
             DensePolynomial::new(bz_bound),
-        )
-    }
-    fn compute_first_quadratic_evals_and_bound_polys_new(
-        preprocess: &JoltSharedPreprocessing,
-        trace: &[Cycle],
-        lagrange_evals_r: &[F; OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE],
-        split_eq_poly: &GruenSplitEqPolynomial<F>,
-    ) -> (
-        F,
-        F,
-        Option<DensePolynomial<F>>,
-        Option<DensePolynomial<F>>,
-        Option<Vec<F>>,
-    ) {
-        let num_x_out_vals = split_eq_poly.E_out_current_len();
-        let num_x_in_vals = split_eq_poly.E_in_current_len();
-        let iter_num_x_in_vars = num_x_in_vals.log_2();
-        let groups_exact = num_x_out_vals
-            .checked_mul(num_x_in_vals)
-            .expect("overflow computing groups_exact");
-
-        let mut az_bound: Vec<F> = unsafe_allocate_zero_vec(2 * groups_exact);
-        let mut bz_bound: Vec<F> = unsafe_allocate_zero_vec(2 * groups_exact);
-
-        const S_SIZE: usize = 3_usize.pow(WINDOW_WIDTH as u32);
-
-        let (t0_acc_unr, t_inf_acc_unr, s) = az_bound
-            .par_chunks_exact_mut(2 * num_x_in_vals)
-            .zip(bz_bound.par_chunks_exact_mut(2 * num_x_in_vals))
-            .enumerate()
-            .fold(
-                || {
-                    (
-                        F::Unreduced::<9>::zero(),
-                        F::Unreduced::<9>::zero(),
-                        [F::Unreduced::<9>::zero(); S_SIZE],
-                    )
-                },
-                |(mut acc0, mut acci, mut s_acc), (x_out_val, (az_chunk, bz_chunk))| {
-                    let mut inner_sum0 = F::Unreduced::<9>::zero();
-                    let mut inner_sum_inf = F::Unreduced::<9>::zero();
-
-                    for x_in_val in 0..num_x_in_vals {
-                        let current_step_idx = (x_out_val << iter_num_x_in_vars) | x_in_val;
-                        let row_inputs =
-                            R1CSCycleInputs::from_trace::<F>(preprocess, trace, current_step_idx);
-                        let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
-
-                        let az0 = eval.az_at_r_first_group(lagrange_evals_r);
-                        let bz0 = eval.bz_at_r_first_group(lagrange_evals_r);
-                        let az1 = eval.az_at_r_second_group(lagrange_evals_r);
-                        let bz1 = eval.bz_at_r_second_group(lagrange_evals_r);
-
-                        let p0 = az0 * bz0;
-                        let p1 = az1 * bz1;
-                        let p_inf = (az1 - az0) * (bz1 - bz0);
-
-                        let e_in = split_eq_poly.E_in_current()[x_in_val];
-                        let e_out = split_eq_poly.E_out_current()[x_out_val];
-
-                        // THIS only works for the first round because we know it'll come from
-                        // E_In
-                        let x_in_bit0 = x_in_val & 1;
-                        let eq_weight = e_in * e_out;
-
-                        s_acc[0 * 3 + x_in_bit0] += eq_weight.mul_unreduced::<9>(p0);
-                        s_acc[1 * 3 + x_in_bit0] += eq_weight.mul_unreduced::<9>(p1);
-                        s_acc[2 * 3 + x_in_bit0] += eq_weight.mul_unreduced::<9>(p_inf);
-
-                        inner_sum0 += e_in.mul_unreduced::<9>(p0);
-                        inner_sum_inf += e_in.mul_unreduced::<9>(p_inf);
-
-                        let off = 2 * x_in_val;
-                        az_chunk[off] = az0;
-                        az_chunk[off + 1] = az1;
-                        bz_chunk[off] = bz0;
-                        bz_chunk[off + 1] = bz1;
-                    }
-
-                    let e_out = split_eq_poly.E_out_current()[x_out_val];
-                    let reduced0 = F::from_montgomery_reduce::<9>(inner_sum0);
-                    let reduced_inf = F::from_montgomery_reduce::<9>(inner_sum_inf);
-                    acc0 += e_out.mul_unreduced::<9>(reduced0);
-                    acci += e_out.mul_unreduced::<9>(reduced_inf);
-
-                    (acc0, acci, s_acc)
-                },
-            )
-            .reduce(
-                || {
-                    (
-                        F::Unreduced::<9>::zero(),
-                        F::Unreduced::<9>::zero(),
-                        [F::Unreduced::<9>::zero(); S_SIZE],
-                    )
-                },
-                |(a0, ai, mut s1), (b0, bi, s2)| {
-                    for i in 0..S_SIZE {
-                        s1[i] += s2[i];
-                    }
-                    (a0 + b0, ai + bi, s1)
-                },
-            );
-
-        // Reduce S
-        let mut s_reduced = [F::zero(); S_SIZE];
-        for i in 0..S_SIZE {
-            s_reduced[i] = F::from_montgomery_reduce::<9>(s[i]);
-        }
-
-        // Verify s_reduced by recomputing from az_bound and bz_bound
-        let mut s_verify = [F::zero(); S_SIZE];
-        for x_out_val in 0..num_x_out_vals {
-            for x_in_val in 0..num_x_in_vals {
-                let x_in_bit0 = x_in_val & 1;
-                let e_in = split_eq_poly.E_in_current()[x_in_val];
-                let e_out = split_eq_poly.E_out_current()[x_out_val];
-                let eq_weight = e_in * e_out;
-
-                let base_idx = x_out_val * (2 * num_x_in_vals) + 2 * x_in_val;
-
-                let az0 = az_bound[base_idx];
-                let az1 = az_bound[base_idx + 1];
-                let bz0 = bz_bound[base_idx];
-                let bz1 = bz_bound[base_idx + 1];
-
-                let p0 = az0 * bz0;
-                let p1 = az1 * bz1;
-                let p_inf = (az1 - az0) * (bz1 - bz0);
-
-                s_verify[0 * 3 + x_in_bit0] += eq_weight * p0;
-                s_verify[1 * 3 + x_in_bit0] += eq_weight * p1;
-                s_verify[2 * 3 + x_in_bit0] += eq_weight * p_inf;
-            }
-        }
-
-        // Assert each element of s_reduced matches
-        for i in 0..S_SIZE {
-            assert_eq!(s_reduced[i], s_verify[i], "s_reduced[{}] mismatch", i);
-        }
-
-        // Marginalize to get t(0), t(∞)
-        let t0_from_window = s_reduced[0 * 3 + 0] + s_reduced[0 * 3 + 1];
-        let t_inf_from_window = s_reduced[2 * 3 + 0] + s_reduced[2 * 3 + 1];
-
-        // Assert t(0) and t(∞)
-        assert_eq!(
-            F::from_montgomery_reduce::<9>(t0_acc_unr),
-            t0_from_window,
-            "t0 mismatch"
-        );
-        assert_eq!(
-            F::from_montgomery_reduce::<9>(t_inf_acc_unr),
-            t_inf_from_window,
-            "t_inf mismatch"
-        );
-
-        (
-            //F::from_montgomery_reduce::<9>(t0_acc_unr),
-            t0_from_window,
-            //F::from_montgomery_reduce::<9>(t_inf_acc_unr),
-            t_inf_from_window,
-            Some(DensePolynomial::new(az_bound)),
-            Some(DensePolynomial::new(bz_bound)),
-            Some(s_reduced.to_vec()),
         )
     }
     // No special binding path needed; az/bz hold interleaved [lo,hi] ready for binding
@@ -662,24 +666,8 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
             )
         }
     }
-    fn remaining_quadratic_evals_new(&mut self) -> (F, F) {
-        let s_ext = self.s_reduced.as_ref().expect("s_reduced should exist");
-        let current_size = s_ext.len();
 
-        if current_size == 1 {
-            println!("Handle S recomputation");
-            return (F::zero(), F::zero());
-        }
-
-        (s_ext[0], s_ext[1])
-
-        //(
-        //    F::from_montgomery_reduce::<9>(t0_unr),
-        //    F::from_montgomery_reduce::<9>(t_inf_unr),
-        //)
-    }
-
-    fn bind_extended_grid(&mut self, r: F::Challenge) {
+    fn _bind_extended_grid(&mut self, r: F::Challenge) {
         let s_ext = self.s_reduced.as_ref().expect("s_reduced should exist");
         let current_size = s_ext.len();
         let num_vars = (current_size as f64).log(3.0).round() as usize;
@@ -738,7 +726,24 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
     )]
     fn compute_prover_message(&mut self, round: usize, previous_claim: F) -> Vec<F> {
         let (t0, t_inf) = if round == 0 {
-            self.first_round_evals // This is working great
+            let t_grid = self.get_grid_aux(
+                &self.split_eq_poly_gen,
+                WINDOW_WIDTH,
+                &self.preprocess,
+                &self.trace,
+                &self.lagrange_evals_r0,
+            );
+
+            let E_active = self.split_eq_poly_gen.E_active_current();
+            // Sum over all Z2 values when Z1=0
+            let w_len = self.split_eq_poly_gen.w.len();
+            let t_prime_0 = t_grid[0] * E_active[0] + t_grid[1] * E_active[1];
+            let t_prime_inf = t_grid[6] * E_active[0] + t_grid[7] * E_active[1];
+
+            let (t0, t_inf) = self.first_round_evals;
+            assert_eq!(t0, t_prime_0);
+            assert_eq!(t_inf, t_prime_inf);
+            (t_prime_0, t_prime_inf)
         } else {
             if self.params.windows.contains(&round) {
                 println!("Start of window: {:?}; recompute", round);
@@ -752,24 +757,27 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
                     self.remaining_quadratic_evals()
                 } else {
                     // Case 3: In-between
-                    // FIXME: BROKEN currently
                     println!("I am in the middle: {:?}", round);
-                    let (t0, t_inf) = self.remaining_quadratic_evals(); // THis is the right
-                    let (debug_0, debug_inf) = self.remaining_quadratic_evals_new();
-                    println!("{:?}, {:?}", t0, debug_0);
-                    println!("{:?}, {:?}", t_inf, debug_inf);
+                    let (t0, t_inf) = self.remaining_quadratic_evals();
                     (t0, t_inf)
                 }
             }
         };
+
         let evals = self
             .split_eq_poly
             .gruen_evals_deg_3(t0, t_inf, previous_claim);
+        if round == 0 {
+            let evals_grid = self
+                .split_eq_poly_gen
+                .gruen_evals_deg_3(t0, t_inf, previous_claim);
+            assert_eq!(evals_grid[0], evals[0]);
+        }
         vec![evals[0], evals[1], evals[2]]
     }
 
     #[tracing::instrument(skip_all, name = "OuterRemainingSumcheckProver::bind")]
-    fn bind(&mut self, r_j: F::Challenge, _round: usize) {
+    fn bind(&mut self, r_j: F::Challenge, round: usize) {
         rayon::join(
             || {
                 self.az
@@ -784,11 +792,12 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
                     .bind_parallel(r_j, BindingOrder::LowToHigh)
             },
         );
-        // Bind the extended grid for S
-        self.bind_extended_grid(r_j);
 
         // Bind eq_poly for next round
         self.split_eq_poly.bind(r_j);
+        if round == 1 || self.params.windows.contains(&round) {
+            println!("Time to re-create stream data structure");
+        }
     }
 
     fn cache_openings(
@@ -1004,7 +1013,7 @@ struct OuterRemainingSumcheckParams<F: JoltField> {
 impl<F: JoltField> OuterRemainingSumcheckParams<F> {
     fn new(num_cycles_bits: usize, uni: &UniSkipState<F>) -> Self {
         let first_half_end: usize = (num_cycles_bits + 1) / 2;
-        let windows = (0..first_half_end).step_by(WINDOW_WIDTH).collect(); // Keep 0-indexed: [0, 2, 4, ...]
+        let windows = (1..first_half_end).step_by(WINDOW_WIDTH).collect(); // If window size 2 Keep 0-indexed: [1, 3, 5, ...]
         Self {
             num_cycles_bits,
             tau: uni.tau.clone(),
