@@ -403,11 +403,6 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         let num_x_in_vals = split_eq_poly.E_in_current_len();
         let num_x_in_vars = num_x_in_vals.log_2();
         let num_x_out_vars = num_x_out_vals.log_2();
-        println!(
-            // 128, 128, 7, 7
-            "{}, {}, {}, {}",
-            num_x_out_vals, num_x_in_vals, num_x_out_vars, num_x_in_vars
-        );
 
         let _num_rs = split_eq_poly.num_challenges();
         let num_active_evals = (0..window_size).fold(1, |acc, _| acc * 3);
@@ -490,8 +485,6 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                                 trace,
                                 lagrange_evals_r,
                             );
-                            // print current_step_idx
-                            println!("current_step_idx: {}", current_step_idx);
 
                             let num_zeros = f_vec.iter().filter(|&&v| v == 0).count();
                             if num_zeros % 2 == 0 {
