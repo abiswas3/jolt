@@ -47,7 +47,7 @@ impl<F: JoltField> GruenSplitEqPolynomialGeneral<F> {
                     || {
                         rayon::join(
                             || EqPolynomial::evals_cached(w_in),
-                            || EqPolynomial::evals_cached(w_active), // Only the active portion
+                            || EqPolynomial::evals_cached_rev(w_active), // Only the active portion
                         )
                     },
                 );
@@ -194,17 +194,19 @@ impl<F: JoltField> GruenSplitEqPolynomialGeneral<F> {
             BindingOrder::LowToHigh => {
                 // multiply `current_scalar` by `eq(w[i], r) = (1 - w[i]) * (1 - r) + w[i] * r`
                 // which is the same as `1 - w[i] - r + 2 * w[i] * r`
-                let prod_w_r = self.w[self.current_index - 1] * r;
+                let prod_w_r = self.w[self.current_index] * r;
                 self.current_scalar *=
-                    F::one() - self.w[self.current_index - 1] - r + prod_w_r + prod_w_r;
+                    F::one() - self.w[self.current_index] - r + prod_w_r + prod_w_r;
                 // decrement `current_index`
                 self.current_index -= 1;
-                // pop the last vector from `E_in_vec` or `E_out_vec` (since we don't need it anymore)
-                if self.w.len() / 2 < self.current_index {
-                    self.E_in_vec.pop();
-                } else if 0 < self.current_index {
-                    self.E_out_vec.pop();
-                }
+                self.E_active.pop();
+                //FIXME: Eventually I'll need to bring these in as well.
+                //// pop the last vector from `E_in_vec` or `E_out_vec` (since we don't need it anymore)
+                //if self.w.len() / 2 < self.current_index {
+                //    self.E_in_vec.pop();
+                //} else if 0 < self.current_index {
+                //    self.E_out_vec.pop();
+                //}
             }
             BindingOrder::HighToLow => {
                 todo!("Not yet implemented");
