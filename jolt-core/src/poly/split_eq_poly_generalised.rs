@@ -209,7 +209,12 @@ impl<F: JoltField> GruenSplitEqPolynomialGeneral<F> {
                     F::one() - self.w[self.current_index] - r + prod_w_r + prod_w_r;
                 // decrement `current_index`
                 self.current_index -= 1;
-                self.E_active.pop();
+
+                if self.E_active.len() > 1 {
+                    self.E_active.pop();
+                } else {
+                    println!("Nothing to pop will have to move things over");
+                }
                 //FIXME: Eventually I'll need to bring these in as well.
                 //// pop the last vector from `E_in_vec` or `E_out_vec` (since we don't need it anymore)
                 //if self.w.len() / 2 < self.current_index {

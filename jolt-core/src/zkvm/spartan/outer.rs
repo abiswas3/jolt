@@ -821,7 +821,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
             (t0, t_inf)
         } else {
             // JUST DEBUGGING
-            if round == 1 {
+            if round == 1 || round == 2 {
                 println!("Computing prover message for round={}", round);
                 let t_grid = self.t_prime_grid.read().unwrap();
                 let grid_ref = t_grid
@@ -877,9 +877,9 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
         );
         // Testing special bind
         // in the first round it'll make t_grid_smaller from 27 to 9
-        // and then i also need to take off the w0 challenge from eq_poly.
-        // in the next round z1 will be the active var and z2 is the
-        if round == 0 {
+        // second bind makes it size 3
+        // third bind should make it a scalar
+        if round == 0 || round == 1 || round == 2 {
             println!("Binding r_{:?}", round);
             self.bind_first_variable_in_place(r_j, WINDOW_WIDTH - round);
             self.split_eq_poly_gen.bind(r_j);
