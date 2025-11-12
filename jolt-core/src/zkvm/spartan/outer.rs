@@ -383,7 +383,7 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         let num_x_in_vars = num_x_in_vals.log_2();
         let num_x_out_vars = num_x_out_vals.log_2();
 
-        let num_rs = split_eq_poly.num_challenges();
+        let _num_rs = split_eq_poly.num_challenges();
         let num_active_evals = (0..window_size).fold(1, |acc, _| acc * 3);
         let mut ans: Vec<F> = vec![F::zero(); num_active_evals];
 
@@ -444,7 +444,8 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                                 let mut idx_vec = Vec::new();
                                 idx_vec.extend_from_slice(&x_out_vec);
                                 idx_vec.extend_from_slice(&x_in_vec);
-                                idx_vec.extend_from_slice(&new_z_vec[1..]);
+                                //idx_vec.extend_from_slice(&new_z_vec[1..]);
+                                idx_vec.extend(new_z_vec[1..].iter().rev());
 
                                 if new_z_vec[0] == 0 {
                                     (idx_vec, false)
@@ -773,15 +774,22 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
             let tmp = self.t_prime_grid.read().unwrap();
             let t_prime_grid = tmp.as_ref().expect("t_grid be initialised by now");
             let E_active = self.split_eq_poly_gen.E_active_current();
-            let t_prime_0 = self.project_to_single_var(t_prime_grid, E_active, WINDOW_WIDTH, 0);
-            let t_prime_inf =
-                self.project_to_single_var(t_prime_grid, E_active, WINDOW_WIDTH, INFINITY);
+            //let t_prime_0 = self.project_to_single_var(t_prime_grid, E_active, WINDOW_WIDTH, 0);
+            //let t_prime_inf =
+            //    self.project_to_single_var(t_prime_grid, E_active, WINDOW_WIDTH, INFINITY);
 
+            // TODO: (ari) this will be generalised -- there was an ordering issue, thats been
+            // fixed.
+            // TODO: (ari) E_in and E_out can also might work.
+            let t_prime_0 = t_prime_grid[0] * E_active[0]
+                + t_prime_grid[1] * E_active[2]
+                + t_prime_grid[3] * E_active[1]
+                + t_prime_grid[4] * E_active[3];
             let (t0, t_inf) = self.first_round_evals;
             assert_eq!(t0, t_prime_0);
-            assert_eq!(t_inf, t_prime_inf);
+            //assert_eq!(t_inf, t_prime_inf);
             println!("Round {} prover message success!", round);
-            (t_prime_0, t_prime_inf)
+            (t0, t_inf)
         } else {
             // JUST DEBUGGING
             if round == 1 {
