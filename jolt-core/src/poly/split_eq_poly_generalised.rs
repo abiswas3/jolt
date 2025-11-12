@@ -35,20 +35,29 @@ impl<F: JoltField> GruenSplitEqPolynomialGeneral<F> {
 
                 // Split the window into active and current
                 let (w_active, w_curr_slice) = w_window.split_at(window_size - 1);
+
+                // | w_active | w_curr
+                // Index: 0                 |    1
+                // | w2(w[14])  w1(w[15])   | w0(w[16])
+                assert_eq!(w_active[0], w[14], "HOW IS ACTIVE STRUCTURED");
+                assert_eq!(w_active[1], w[15], "HOW IS ACTIVE STRUCTURED");
+
                 let _ = w_curr_slice[0]; // The current/last variable
 
                 // Now split w_body into w_out and w_in
                 let m = w_body.len() / 2;
                 let (w_out, w_in) = w_body.split_at(m);
 
+                // window size = 3 and T+1= 17 works well (plus 1 for the selector)
+                assert_eq!(w_out[0], w[0]);
+                assert_eq!(w_in[0], w[7]);
                 // Compute evaluations in parallel
                 let (E_out_vec, rest) = rayon::join(
                     || EqPolynomial::evals_cached(w_out),
                     || {
                         rayon::join(
                             || EqPolynomial::evals_cached(w_in),
-                            || EqPolynomial::evals_cached(w_active), // THE ORDER SHOULD
-                                                                     // MATTER!!
+                            || EqPolynomial::evals_cached(w_active),
                         )
                     },
                 );
