@@ -435,9 +435,8 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
             for (out_idx, out_val) in split_eq_poly.E_out_current().iter().enumerate() {
                 // x_out_vec represents the binary pattern for w10...w16
                 // out_idx=0 → x_out_vec=[0,0,0,0,0,0,0]
-                // out_idx=1 → x_out_vec=[1,0,0,0,0,0,0] is show this should look
+                // out_idx=1 → x_out_vec=[0,0,0,0,0,0,1]
                 let x_out_vec = self.digitize(out_idx, 2, num_x_out_vars);
-                println!("OUT_idx: {:?} x_out_vec: {:?}", out_idx, x_out_vec);
                 // Iterate over E_in evaluations
                 // in_idx=0 → eq(w3...w9, 0000000)
                 // in_idx=1 → eq(w3...w9, 0000001), etc.
@@ -496,7 +495,6 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                                 idx_vec.extend_from_slice(trace_coords); // [w1, w2] bits
                                 idx_vec.extend_from_slice(&x_in_vec); // [w3...w9] bits
                                 idx_vec.extend_from_slice(&x_out_vec); // [w10...w16] bits
-                                                                       // w0 value determines selector
                                 if new_z_vec[0] == 0 {
                                     (idx_vec, false)
                                 } else {
@@ -508,7 +506,12 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                             let current_step_idx = index_vec
                                 .iter()
                                 .fold(0usize, |acc, &bit| (acc << 1) | (bit as usize));
-
+                            println!("  out_idx={}, in_idx={}", out_idx, in_idx);
+                            println!("  z_1, z2: ={:?}", &new_z_vec[1..]);
+                            println!("  x_out_vec={:?}, x_in_vec={:?}", x_out_vec, x_in_vec);
+                            println!("  Full index_vec={:?}", index_vec);
+                            println!("  Trace index={}", current_step_idx);
+                            println!("  out_val={:?}, in_val={:?}", out_val, in_val);
                             let (az, bz) = self.get_az_bz_at_curr_timestep(
                                 current_step_idx,
                                 selector,
