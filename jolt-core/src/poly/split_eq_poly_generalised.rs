@@ -47,7 +47,8 @@ impl<F: JoltField> GruenSplitEqPolynomialGeneral<F> {
                     || {
                         rayon::join(
                             || EqPolynomial::evals_cached(w_in),
-                            || EqPolynomial::evals_cached_rev(w_active), // Only the active portion
+                            || EqPolynomial::evals_cached(w_active), // THE ORDER SHOULD
+                                                                     // MATTER!!
                         )
                     },
                 );

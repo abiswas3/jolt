@@ -773,18 +773,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
             let tmp = self.t_prime_grid.read().unwrap();
             let t_prime_grid = tmp.as_ref().expect("t_grid be initialised by now");
             let E_active = self.split_eq_poly_gen.E_active_current();
-            // Sum over all Z2 values when Z1=0
-            // NOTE: (ari) i have this code that generalises this for generic window sizes
-            // this is for debug purposes only!!!
-            //let t_prime_0 = t_grid[0] * E_active[0]
-            //    + t_grid[1] * E_active[1]
-            //    + t_grid[3] * E_active[2]
-            //    + t_grid[4] * E_active[3];
-            //
-            //let t_prime_inf = t_grid[18] * E_active[0]
-            //    + t_grid[19] * E_active[1]
-            //    + t_grid[21] * E_active[2]
-            //    + t_grid[22] * E_active[3];
             let t_prime_0 = self.project_to_single_var(t_prime_grid, E_active, WINDOW_WIDTH, 0);
             let t_prime_inf =
                 self.project_to_single_var(t_prime_grid, E_active, WINDOW_WIDTH, INFINITY);
@@ -808,12 +796,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
                 //    self.project_to_single_var(grid_ref, E_active, WINDOW_WIDTH - round, 0);
                 //let _t_prime_inf =
                 //    self.project_to_single_var(grid_ref, E_active, WINDOW_WIDTH - round, INFINITY);
-                println!("After binding, grid check:");
-                println!("grid[0] (z1=0,z2=0) = {:?}", grid_ref[0]);
-                println!("grid[1] (z1=0,z2=1) = {:?}", grid_ref[1]);
-                println!("grid[3] (z1=1,z2=0) = {:?}", grid_ref[3]);
-                println!("grid[4] (z1=1,z2=1) = {:?}", grid_ref[4]);
-
                 // Manually check the interpolation for grid[0]
                 let w_idx = 14;
                 let t_prime_0 = grid_ref[0] * (F::one() - self.split_eq_poly_gen.w[w_idx])
