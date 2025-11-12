@@ -447,25 +447,25 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                             }
 
                             let (index_vec, selector) = if split_eq_poly.num_challenges() > 0 {
-                                // Concatenate: x_out_vec || x_in_vec || new_z_vec || r_vec[1:]
+                                // Concatenate: x_out_vec || x_in_vec || new_z_vec || r_vec[:-1]
+                                // NOTE: position 0 contains the MSB
                                 let mut idx_vec = Vec::new();
                                 idx_vec.extend_from_slice(&x_out_vec);
                                 idx_vec.extend_from_slice(&x_in_vec);
                                 idx_vec.extend_from_slice(&new_z_vec);
-                                idx_vec.extend_from_slice(&r_vec[1..]);
-                                if r_vec[0] == 0 {
+                                idx_vec.extend_from_slice(&r_vec[..window_size - 1]);
+                                if r_vec[window_size - 1] == 0 {
                                     (idx_vec, false)
                                 } else {
                                     (idx_vec, true)
                                 }
                             } else {
                                 // Concatenate: x_out_vec || x_in_vec || new_z_vec[1:]
+                                // NOTE: position 0 contains the MSB
                                 let mut idx_vec = Vec::new();
                                 idx_vec.extend_from_slice(&x_out_vec);
                                 idx_vec.extend_from_slice(&x_in_vec);
-                                // Last index is the least significant digit
                                 idx_vec.extend_from_slice(&new_z_vec[..window_size - 1]);
-                                //idx_vec.extend(new_z_vec[1..].iter().rev());
 
                                 if new_z_vec[window_size - 1] == 0 {
                                     (idx_vec, false)
@@ -500,9 +500,20 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
 
                         // Also need to handle eq polynomial for r if there are challenges
                         let eq_r = if split_eq_poly.num_challenges() > 0 {
-                            // Compute eq(r_vec, challenges)
-                            //self.eq(&r_vec, split_eq_poly.get_challenges())
-                            todo!("hAndle the binding business")
+                            let challenges = split_eq_poly.get_challenges();
+                            let num_chal = split_eq_poly.num_challenges();
+                            let mut eq_val = F::one();
+
+                            for (i, &r_bit) in r_vec.iter().enumerate() {
+                                // Map r_vec index to challenge index
+                                let challenge_idx = num_chal - 1 - i;
+                                if r_bit == 0 {
+                                    eq_val = eq_val * (F::one() - challenges[challenge_idx]);
+                                } else {
+                                    eq_val = eq_val * challenges[challenge_idx];
+                                }
+                            }
+                            eq_val
                         } else {
                             F::one()
                         };
@@ -840,6 +851,29 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
                 assert_eq!(t_inf, t_prime_inf, "tinf != t_prime_inf");
                 println!("Prover message round : {} SUCCESS", round);
                 (t0, t_inf)
+            } else if round == 4 {
+                println!("By now a new E_active should have been formed");
+                self.get_grid_aux(
+                    &self.split_eq_poly_gen,
+                    WINDOW_WIDTH,
+                    &self.preprocess,
+                    &self.trace,
+                    &self.lagrange_evals_r0,
+                );
+
+                println!("Computing prover message for round={}", round);
+                let tmp = self.t_prime_grid.read().unwrap();
+                let t_prime_grid = tmp.as_ref().expect("t_grid be initialised by now");
+                let E_active = self.split_eq_poly_gen.E_active_current();
+
+                let t_prime_0 = self.project_to_single_var(t_prime_grid, E_active, WINDOW_WIDTH, 0);
+                let t_prime_inf =
+                    self.project_to_single_var(t_prime_grid, E_active, WINDOW_WIDTH, INFINITY);
+                let (t0, t_inf) = self.remaining_quadratic_evals();
+                assert_eq!(t0, t_prime_0);
+                assert_eq!(t_inf, t_prime_inf);
+                println!("Round {} prover message success!", round);
+                (t0, t_inf)
             } else {
                 // All other rounds for now
                 let (t0, t_inf) = self.remaining_quadratic_evals();
@@ -882,11 +916,11 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
         if round == 0 || round == 1 || round == 2 {
             println!("Binding r_{:?}", round);
             self.bind_first_variable_in_place(r_j, WINDOW_WIDTH - round);
-            self.split_eq_poly_gen.bind(r_j);
+            self.split_eq_poly_gen.bind(r_j, WINDOW_WIDTH - round);
         }
         // Bind eq_poly for next round
         self.split_eq_poly.bind(r_j);
-        if round == 1 || self.params.windows.contains(&round) {
+        if self.params.windows.contains(&round) {
             println!(
                 "Time to re-create stream data structure for round: {}",
                 round
@@ -1107,7 +1141,7 @@ struct OuterRemainingSumcheckParams<F: JoltField> {
 impl<F: JoltField> OuterRemainingSumcheckParams<F> {
     fn new(num_cycles_bits: usize, uni: &UniSkipState<F>) -> Self {
         let first_half_end: usize = (num_cycles_bits + 1) / 2;
-        let windows = (1..first_half_end).step_by(WINDOW_WIDTH).collect(); // If window size 2 Keep 0-indexed: [1, 3, 5, ...]
+        let windows = (0..first_half_end).step_by(WINDOW_WIDTH).collect();
         Self {
             num_cycles_bits,
             tau: uni.tau.clone(),

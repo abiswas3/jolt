@@ -199,7 +199,7 @@ impl<F: JoltField> GruenSplitEqPolynomialGeneral<F> {
     }
 
     #[tracing::instrument(skip_all, name = "GruenSplitEqPolynomial::bind")]
-    pub fn bind(&mut self, r: F::Challenge) {
+    pub fn bind(&mut self, r: F::Challenge, window_size: usize) {
         match self.binding_order {
             BindingOrder::LowToHigh => {
                 // multiply `current_scalar` by `eq(w[i], r) = (1 - w[i]) * (1 - r) + w[i] * r`
@@ -208,20 +208,45 @@ impl<F: JoltField> GruenSplitEqPolynomialGeneral<F> {
                 self.current_scalar *=
                     F::one() - self.w[self.current_index] - r + prod_w_r + prod_w_r;
                 // decrement `current_index`
+                println!(
+                    "Index being bound: {} Curr index now at: {}",
+                    self.current_index,
+                    self.current_index - 1
+                );
                 self.current_index -= 1;
 
                 if self.E_active.len() > 1 {
                     self.E_active.pop();
                 } else {
-                    println!("Nothing to pop will have to move things over");
+                    println!("A Fresh E_Active");
+                    let remaining_w = &self.w[..self.current_index + 1];
+                    let window_start = remaining_w.len() - window_size;
+
+                    let (w_body, w_window) = remaining_w.split_at(window_start);
+                    let (w_active, w_curr_slice) = w_window.split_at(window_size - 1);
+                    let _ = w_curr_slice[0]; // The current variable
+
+                    // Split w_body into w_out and w_in
+                    let m = w_body.len() / 2;
+                    let (w_out, w_in) = w_body.split_at(m);
+
+                    // Recompute evaluations
+                    let (E_out_vec, rest) = rayon::join(
+                        || EqPolynomial::evals_cached(w_out),
+                        || {
+                            rayon::join(
+                                || EqPolynomial::evals_cached(w_in),
+                                || EqPolynomial::evals_cached(w_active),
+                            )
+                        },
+                    );
+                    let (E_in_vec, E_active) = rest;
+
+                    // Update the stored vectors
+                    self.E_out_vec = E_out_vec;
+                    self.E_in_vec = E_in_vec;
+                    self.E_active = E_active;
                 }
-                //FIXME: Eventually I'll need to bring these in as well.
-                //// pop the last vector from `E_in_vec` or `E_out_vec` (since we don't need it anymore)
-                //if self.w.len() / 2 < self.current_index {
-                //    self.E_in_vec.pop();
-                //} else if 0 < self.current_index {
-                //    self.E_out_vec.pop();
-                //}
             }
             BindingOrder::HighToLow => {
                 todo!("Not yet implemented");
