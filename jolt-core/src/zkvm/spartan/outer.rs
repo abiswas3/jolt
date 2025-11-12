@@ -1,8 +1,7 @@
 use allocative::Allocative;
 use ark_std::Zero;
-use jolt_platform::print;
 use rayon::prelude::*;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tracer::instruction::Cycle;
 
 use crate::field::{FMAdd, JoltField, MontgomeryReduce};
@@ -50,8 +49,8 @@ use crate::zkvm::r1cs::inputs::JoltR1CSInputs;
 
 /// Degree bound of the sumcheck round polynomials for [`OuterRemainingSumcheckVerifier`].
 const OUTER_REMAINING_DEGREE_BOUND: usize = 3;
-const WINDOW_WIDTH: usize = 2;
-const INFINITY: u32 = 2; // 2 represents ∞ in base-3
+const WINDOW_WIDTH: usize = 3;
+const INFINITY: usize = 2; // 2 represents ∞ in base-3
 
 // Spartan Outer sumcheck
 // (with univariate-skip first round on Z, and no Cz term given all eq conditional constraints)
@@ -259,7 +258,7 @@ pub struct OuterRemainingSumcheckProver<F: JoltField> {
     // We still have these but their sizes will change
     az: Option<DensePolynomial<F>>,
     bz: Option<DensePolynomial<F>>,
-    s_reduced: Option<Vec<F>>,
+    t_prime_grid: RwLock<Option<Vec<F>>>, // Interior mutability for just this field
     /// The first round evals (t0, t_inf) computed from a streaming pass over the trace
     first_round_evals: (F, F),
     #[allocative(skip)]
@@ -323,10 +322,11 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
             split_eq_poly,
             split_eq_poly_gen,
             preprocess: Arc::new(preprocessing.shared.clone()),
+            // FIXME: Attention Quang this needs to be changed.
             trace: Arc::new(trace.to_vec()),
             az: Some(az_bound), // TB deleted
             bz: Some(bz_bound), // To be deleted
-            s_reduced: None,
+            t_prime_grid: RwLock::new(None),
             first_round_evals: (t0, t_inf),
             params: outer_params,
             lagrange_evals_r0: lagrange_evals_r,
@@ -346,8 +346,59 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         }
         ans
     }
+    fn bind_first_variable_in_place(&self, r: F::Challenge, w: usize) {
+        let mut grid_guard = self.t_prime_grid.write().unwrap();
+        if let Some(ref mut t_grid) = *grid_guard {
+            let new_size = 3_usize.pow((w - 1) as u32);
+            let mut t_grid_bound = vec![F::zero(); new_size];
 
-    /// returns the grid of evaluations on 3^window_size
+            // For each point in the new (w-1)-dimensional grid
+            for new_idx in 0..new_size {
+                // Since first coord is most significant and changes every new_size elements:
+                let eval_at_0 = t_grid[new_idx]; // z0 = 0
+                let eval_at_1 = t_grid[new_idx + new_size]; // z0 = 1
+                let eval_at_inf = t_grid[new_idx + 2 * new_size]; // z0 = ∞
+
+                // Interpolate and evaluate at r
+                let one = F::one();
+                t_grid_bound[new_idx] =
+                    eval_at_0 * (one - r) + eval_at_1 * r + eval_at_inf * r * (r - one);
+            }
+
+            *t_grid = t_grid_bound;
+        }
+    }
+
+    fn project_to_single_var(
+        &self,
+        t_grid: &[F],
+        E_active: &[F],
+        w: usize,
+        first_coord_val: usize,
+    ) -> F {
+        let offset = first_coord_val * 3_usize.pow((w - 1) as u32);
+
+        println!("Projection Begins: {}", first_coord_val);
+        E_active
+            .iter()
+            .enumerate()
+            .map(|(eq_active_idx, eq_active_val)| {
+                let mut index = offset;
+                let mut temp = eq_active_idx;
+                let mut power = 1;
+                for _ in 0..(w - 1) {
+                    if temp & 1 == 1 {
+                        index += power;
+                    }
+                    power *= 3;
+                    temp >>= 1;
+                }
+                println!("t_grid[{}] * E_active[{}]", index, eq_active_idx);
+                t_grid[index] * *eq_active_val
+            })
+            .sum()
+    }
+
     fn get_grid_aux(
         &self,
         split_eq_poly: &GruenSplitEqPolynomialGeneral<F>,
@@ -355,33 +406,53 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         preprocess: &JoltSharedPreprocessing,
         trace: &[Cycle],
         lagrange_evals_r: &[F; OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE],
-    ) -> Vec<F> {
-        let num_x_out_vals = split_eq_poly.E_out_current_len();
-        let num_x_in_vals = split_eq_poly.E_in_current_len();
-        let num_x_in_vars = num_x_in_vals.log_2();
-        let num_x_out_vars = num_x_out_vals.log_2();
+    ) {
+        // The comments assume T = 2^16
+        // window size was initially 3 so z0, z1, z2 are active variables.
+        // E_out_current() returns the last level: [eq(w10...w16, 0000000), eq(w10...w16, 0000001), ...]
+        let num_x_out_vals = split_eq_poly.E_out_current_len(); // Should be 2^7 = 128
 
-        let num_rs = split_eq_poly.num_challenges();
-        let num_active_evals = (0..window_size).fold(1, |acc, _| acc * 3);
+        // E_in_current() returns the last level: [eq(w3...w9, 0000000), eq(w3...w9, 0000001), ...]
+        let num_x_in_vals = split_eq_poly.E_in_current_len(); // Should be 2^7 = 128
+        let num_x_in_vars = num_x_in_vals.log_2(); // 7 variables
+        let num_x_out_vars = num_x_out_vals.log_2(); // 7 variables
+
+        let _num_rs = split_eq_poly.num_challenges();
+        let num_active_evals = (0..window_size).fold(1, |acc, _| acc * 3); // 3^3 = 27 for window_size=3
         let mut ans: Vec<F> = vec![F::zero(); num_active_evals];
 
+        // Loop over all 27 grid points for the window variables [w0, w1, w2]
         for a_idx in 0..num_active_evals {
+            // z_vec is [z0, z1, z2] where z0 ↔ w0, z1 ↔ w1, z2 ↔ w2 is the mapping between the
+            // challenges and variables.
             let z_vec = self.digitize(a_idx, 3, window_size);
-            let mut accumulator = F::zero(); // Unreduced accumulator
+
+            let mut accumulator = F::zero();
+
+            // Iterate over E_out evaluations
+            // out_idx=0 → eq(w10...w16, 0000000)
+            // out_idx=1 → eq(w10...w16, 0000001), etc.
             for (out_idx, out_val) in split_eq_poly.E_out_current().iter().enumerate() {
-                let x_out_vec = self.digitize(out_idx, 2, num_x_out_vals);
+                // x_out_vec represents the binary pattern for w10...w16
+                // out_idx=0 → x_out_vec=[0,0,0,0,0,0,0]
+                // out_idx=1 → x_out_vec=[1,0,0,0,0,0,0] is show this should look
+                let x_out_vec = self.digitize(out_idx, 2, num_x_out_vars);
+                println!("OUT_idx: {:?} x_out_vec: {:?}", out_idx, x_out_vec);
+                // Iterate over E_in evaluations
+                // in_idx=0 → eq(w3...w9, 0000000)
+                // in_idx=1 → eq(w3...w9, 0000001), etc.
                 for (in_idx, in_val) in split_eq_poly.E_in_current().iter().enumerate() {
-                    let x_in_vec = self.digitize(in_idx, 2, num_x_in_vars);
+                    // x_in_vec represents the binary pattern for w3...w9
+                    let x_in_vec = self.digitize(in_idx, 2, num_x_in_vars); // This is correct - using num_x_in_vars
 
                     for r_idx in 0..split_eq_poly.num_challenges().max(1) {
                         let r_vec = if split_eq_poly.num_challenges() > 0 {
                             self.digitize(r_idx, 2, split_eq_poly.num_challenges())
                         } else {
-                            vec![] // Empty vec when no challenges
+                            vec![]
                         };
-                        // a_idx is a 3^windown size
-                        // time_step_idx = out_idx_in_bits || in_idx_bits || a_idx_in_bits ||
-                        // r_idx_in_bits
+
+                        // Handle infinity values in z_vec
                         let mut inf_indices: Vec<usize> = Vec::new();
                         for z_idx in 0..z_vec.len() {
                             if z_vec[z_idx] == 2 {
@@ -392,12 +463,14 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                         let num_infs = inf_indices.len();
                         let mut A_mess = F::zero();
                         let mut B_mess = F::zero();
+
+                        // Sum over all combinations where infinity is replaced with 0/1
                         for f_in in 0..(1 << num_infs) {
                             let f_vec = self.digitize(f_in, 2, num_infs);
                             let mut new_z_vec = Vec::new();
                             let mut curr_f_index = 0;
                             for z_in in 0..z_vec.len() {
-                                if z_vec[z_in] == INFINITY {
+                                if z_vec[z_in] == INFINITY as u32 {
                                     new_z_vec.push(f_vec[curr_f_index]);
                                     curr_f_index += 1;
                                 } else {
@@ -405,25 +478,25 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                                 }
                             }
 
+                            // Build the index for trace lookup
                             let (index_vec, selector) = if split_eq_poly.num_challenges() > 0 {
-                                // Concatenate: x_out_vec || x_in_vec || new_z_vec || r_vec[1:]
                                 let mut idx_vec = Vec::new();
-                                idx_vec.extend_from_slice(&x_out_vec);
-                                idx_vec.extend_from_slice(&x_in_vec);
-                                idx_vec.extend_from_slice(&new_z_vec);
                                 idx_vec.extend_from_slice(&r_vec[1..]);
+                                idx_vec.extend_from_slice(&new_z_vec); // [w0, w1, w2] bits
+                                idx_vec.extend_from_slice(&x_in_vec); // [w3...w9] bits
+                                idx_vec.extend_from_slice(&x_out_vec); // [w10...w16] bits
                                 if r_vec[0] == 0 {
                                     (idx_vec, false)
                                 } else {
                                     (idx_vec, true)
                                 }
                             } else {
-                                // Concatenate: x_out_vec || x_in_vec || new_z_vec[1:]
                                 let mut idx_vec = Vec::new();
-                                idx_vec.extend_from_slice(&x_out_vec);
-                                idx_vec.extend_from_slice(&x_in_vec);
-                                idx_vec.extend_from_slice(&new_z_vec[1..]);
-
+                                let trace_coords = &new_z_vec[1..]; // Skip w0, use [w1, w2]
+                                idx_vec.extend_from_slice(trace_coords); // [w1, w2] bits
+                                idx_vec.extend_from_slice(&x_in_vec); // [w3...w9] bits
+                                idx_vec.extend_from_slice(&x_out_vec); // [w10...w16] bits
+                                                                       // w0 value determines selector
                                 if new_z_vec[0] == 0 {
                                     (idx_vec, false)
                                 } else {
@@ -431,7 +504,7 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                                 }
                             };
 
-                            // Convert binary vector to single index
+                            // Convert binary vector to index
                             let current_step_idx = index_vec
                                 .iter()
                                 .fold(0usize, |acc, &bit| (acc << 1) | (bit as usize));
@@ -443,29 +516,25 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                                 trace,
                                 lagrange_evals_r,
                             );
-                            //println!("Current time idx: {current_step_idx} Selector: {selector}");
-                            //println!("Az: {:?}", az);
+
+                            // Sign depends on parity of zeros in f_vec
                             let num_zeros = f_vec.iter().filter(|&&v| v == 0).count();
                             if num_zeros % 2 == 0 {
-                                // Positive contribution
                                 A_mess = A_mess + az;
                                 B_mess = B_mess + bz;
                             } else {
-                                // Negative contribution
                                 A_mess = A_mess - az;
                                 B_mess = B_mess - bz;
                             }
                         }
 
-                        // Also need to handle eq polynomial for r if there are challenges
                         let eq_r = if split_eq_poly.num_challenges() > 0 {
-                            // Compute eq(r_vec, challenges)
-                            //self.eq(&r_vec, split_eq_poly.get_challenges())
-                            todo!("hAndle the binding business")
+                            split_eq_poly.challenge_constant()
                         } else {
                             F::one()
                         };
 
+                        // Multiply by the equality polynomial values
                         let product = A_mess * B_mess * eq_r * out_val * in_val;
                         accumulator = accumulator + product;
                     }
@@ -473,8 +542,256 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
             }
             ans[a_idx] = accumulator;
         }
-        ans
+
+        *self.t_prime_grid.write().unwrap() = Some(ans);
     }
+    /// The new but broken one
+    //fn get_grid_aux(
+    //    &self,
+    //    split_eq_poly: &GruenSplitEqPolynomialGeneral<F>,
+    //    window_size: usize,
+    //    preprocess: &JoltSharedPreprocessing,
+    //    trace: &[Cycle],
+    //    lagrange_evals_r: &[F; OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE],
+    //) {
+    //    let num_x_out_vals = split_eq_poly.E_out_current_len();
+    //    let num_x_in_vals = split_eq_poly.E_in_current_len();
+    //    let num_x_in_vars = num_x_in_vals.log_2();
+    //    let _num_x_out_vars = num_x_out_vals.log_2();
+    //
+    //    let _num_rs = split_eq_poly.num_challenges();
+    //    let num_active_evals = (0..window_size).fold(1, |acc, _| acc * 3);
+    //    let mut ans: Vec<F> = vec![F::zero(); num_active_evals];
+    //
+    //    for a_idx in 0..num_active_evals {
+    //        let z_vec = self.digitize(a_idx, 3, window_size);
+    //
+    //        let mut accumulator = F::zero();
+    //        for (out_idx, out_val) in split_eq_poly.E_out_current().iter().enumerate() {
+    //            let x_out_vec = self.digitize(out_idx, 2, num_x_out_vals);
+    //            for (in_idx, in_val) in split_eq_poly.E_in_current().iter().enumerate() {
+    //                let x_in_vec = self.digitize(in_idx, 2, num_x_in_vars);
+    //
+    //                for r_idx in 0..split_eq_poly.num_challenges().max(1) {
+    //                    let r_vec = if split_eq_poly.num_challenges() > 0 {
+    //                        self.digitize(r_idx, 2, split_eq_poly.num_challenges())
+    //                    } else {
+    //                        vec![]
+    //                    };
+    //
+    //                    let mut inf_indices: Vec<usize> = Vec::new();
+    //                    for z_idx in 0..z_vec.len() {
+    //                        if z_vec[z_idx] == 2 {
+    //                            inf_indices.push(z_idx);
+    //                        }
+    //                    }
+    //
+    //                    let num_infs = inf_indices.len();
+    //                    let mut A_mess = F::zero();
+    //                    let mut B_mess = F::zero();
+    //                    for f_in in 0..(1 << num_infs) {
+    //                        let f_vec = self.digitize(f_in, 2, num_infs);
+    //                        let mut new_z_vec = Vec::new();
+    //                        let mut curr_f_index = 0;
+    //                        for z_in in 0..z_vec.len() {
+    //                            if z_vec[z_in] == INFINITY as u32 {
+    //                                new_z_vec.push(f_vec[curr_f_index]);
+    //                                curr_f_index += 1;
+    //                            } else {
+    //                                new_z_vec.push(z_vec[z_in]);
+    //                            }
+    //                        }
+    //
+    //                        let (index_vec, selector) = if split_eq_poly.num_challenges() > 0 {
+    //                            let mut idx_vec = Vec::new();
+    //                            idx_vec.extend_from_slice(&r_vec[1..]);
+    //                            idx_vec.extend_from_slice(&new_z_vec);
+    //                            idx_vec.extend_from_slice(&x_in_vec);
+    //                            idx_vec.extend_from_slice(&x_out_vec);
+    //                            if r_vec[0] == 0 {
+    //                                (idx_vec, false)
+    //                            } else {
+    //                                (idx_vec, true)
+    //                            }
+    //                        } else {
+    //                            let mut idx_vec = Vec::new();
+    //                            let trace_coords = &new_z_vec[1..];
+    //                            idx_vec.extend_from_slice(trace_coords);
+    //                            idx_vec.extend_from_slice(&x_in_vec);
+    //                            idx_vec.extend_from_slice(&x_out_vec);
+    //                            if new_z_vec[0] == 0 {
+    //                                (idx_vec, false)
+    //                            } else {
+    //                                (idx_vec, true)
+    //                            }
+    //                        };
+    //
+    //                        let current_step_idx = index_vec
+    //                            .iter()
+    //                            .fold(0usize, |acc, &bit| (acc << 1) | (bit as usize));
+    //
+    //                        let (az, bz) = self.get_az_bz_at_curr_timestep(
+    //                            current_step_idx,
+    //                            selector,
+    //                            preprocess,
+    //                            trace,
+    //                            lagrange_evals_r,
+    //                        );
+    //
+    //                        let num_zeros = f_vec.iter().filter(|&&v| v == 0).count();
+    //                        if num_zeros % 2 == 0 {
+    //                            A_mess = A_mess + az;
+    //                            B_mess = B_mess + bz;
+    //                        } else {
+    //                            A_mess = A_mess - az;
+    //                            B_mess = B_mess - bz;
+    //                        }
+    //                    }
+    //
+    //                    let eq_r = if split_eq_poly.num_challenges() > 0 {
+    //                        split_eq_poly.challenge_constant()
+    //                    } else {
+    //                        F::one()
+    //                    };
+    //
+    //                    let product = A_mess * B_mess * eq_r * out_val * in_val;
+    //                    accumulator = accumulator + product;
+    //                }
+    //            }
+    //        }
+    //        ans[a_idx] = accumulator;
+    //    }
+    //
+    //    *self.t_prime_grid.write().unwrap() = Some(ans);
+    //}
+
+    /// returns the grid of evaluations on 3^window_size
+    //fn get_grid_aux(
+    //    &self,
+    //    split_eq_poly: &GruenSplitEqPolynomialGeneral<F>,
+    //    window_size: usize,
+    //    preprocess: &JoltSharedPreprocessing,
+    //    trace: &[Cycle],
+    //    lagrange_evals_r: &[F; OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE],
+    //) {
+    //    let num_x_out_vals = split_eq_poly.E_out_current_len();
+    //    let num_x_in_vals = split_eq_poly.E_in_current_len();
+    //    let num_x_in_vars = num_x_in_vals.log_2();
+    //    let _num_x_out_vars = num_x_out_vals.log_2();
+    //
+    //    let _num_rs = split_eq_poly.num_challenges();
+    //    let num_active_evals = (0..window_size).fold(1, |acc, _| acc * 3);
+    //    let mut ans: Vec<F> = vec![F::zero(); num_active_evals];
+    //
+    //    for a_idx in 0..num_active_evals {
+    //        let z_vec = self.digitize(a_idx, 3, window_size);
+    //        let mut accumulator = F::zero(); // Unreduced accumulator
+    //        for (out_idx, out_val) in split_eq_poly.E_out_current().iter().enumerate() {
+    //            let x_out_vec = self.digitize(out_idx, 2, num_x_out_vals);
+    //            for (in_idx, in_val) in split_eq_poly.E_in_current().iter().enumerate() {
+    //                let x_in_vec = self.digitize(in_idx, 2, num_x_in_vars);
+    //
+    //                for r_idx in 0..split_eq_poly.num_challenges().max(1) {
+    //                    let r_vec = if split_eq_poly.num_challenges() > 0 {
+    //                        self.digitize(r_idx, 2, split_eq_poly.num_challenges())
+    //                    } else {
+    //                        vec![] // Empty vec when no challenges
+    //                    };
+    //                    // a_idx is a 3^windown size
+    //                    // time_step_idx = out_idx_in_bits || in_idx_bits || a_idx_in_bits ||
+    //                    // r_idx_in_bits
+    //                    let mut inf_indices: Vec<usize> = Vec::new();
+    //                    for z_idx in 0..z_vec.len() {
+    //                        if z_vec[z_idx] == 2 {
+    //                            inf_indices.push(z_idx);
+    //                        }
+    //                    }
+    //
+    //                    let num_infs = inf_indices.len();
+    //                    let mut A_mess = F::zero();
+    //                    let mut B_mess = F::zero();
+    //                    for f_in in 0..(1 << num_infs) {
+    //                        let f_vec = self.digitize(f_in, 2, num_infs);
+    //                        let mut new_z_vec = Vec::new();
+    //                        let mut curr_f_index = 0;
+    //                        for z_in in 0..z_vec.len() {
+    //                            if z_vec[z_in] == INFINITY as u32 {
+    //                                new_z_vec.push(f_vec[curr_f_index]);
+    //                                curr_f_index += 1;
+    //                            } else {
+    //                                new_z_vec.push(z_vec[z_in]);
+    //                            }
+    //                        }
+    //
+    //                        let (index_vec, selector) = if split_eq_poly.num_challenges() > 0 {
+    //                            // Concatenate: x_out_vec || x_in_vec || new_z_vec || r_vec[1:]
+    //                            let mut idx_vec = Vec::new();
+    //                            idx_vec.extend_from_slice(&x_out_vec);
+    //                            idx_vec.extend_from_slice(&x_in_vec);
+    //                            idx_vec.extend_from_slice(&new_z_vec);
+    //                            idx_vec.extend_from_slice(&r_vec[1..]);
+    //                            if r_vec[0] == 0 {
+    //                                (idx_vec, false)
+    //                            } else {
+    //                                (idx_vec, true)
+    //                            }
+    //                        } else {
+    //                            // Concatenate: x_out_vec || x_in_vec || new_z_vec[1:]
+    //                            let mut idx_vec = Vec::new();
+    //                            idx_vec.extend_from_slice(&x_out_vec);
+    //                            idx_vec.extend_from_slice(&x_in_vec);
+    //                            idx_vec.extend_from_slice(&new_z_vec[1..]);
+    //
+    //                            if new_z_vec[0] == 0 {
+    //                                (idx_vec, false)
+    //                            } else {
+    //                                (idx_vec, true)
+    //                            }
+    //                        };
+    //
+    //                        // Convert binary vector to single index
+    //                        let current_step_idx = index_vec
+    //                            .iter()
+    //                            .fold(0usize, |acc, &bit| (acc << 1) | (bit as usize));
+    //
+    //                        let (az, bz) = self.get_az_bz_at_curr_timestep(
+    //                            current_step_idx,
+    //                            selector,
+    //                            preprocess,
+    //                            trace,
+    //                            lagrange_evals_r,
+    //                        );
+    //                        //println!("Current time idx: {current_step_idx} Selector: {selector}");
+    //                        //println!("Az: {:?}", az);
+    //                        let num_zeros = f_vec.iter().filter(|&&v| v == 0).count();
+    //                        if num_zeros % 2 == 0 {
+    //                            // Positive contribution
+    //                            A_mess = A_mess + az;
+    //                            B_mess = B_mess + bz;
+    //                        } else {
+    //                            // Negative contribution
+    //                            A_mess = A_mess - az;
+    //                            B_mess = B_mess - bz;
+    //                        }
+    //                    }
+    //
+    //                    // Also need to handle eq polynomial for r if there are challenges
+    //                    let eq_r = if split_eq_poly.num_challenges() > 0 {
+    //                        // Compute eq(r_vec, challenges)
+    //                        split_eq_poly.challenge_constant()
+    //                    } else {
+    //                        F::one()
+    //                    };
+    //
+    //                    let product = A_mess * B_mess * eq_r * out_val * in_val;
+    //                    accumulator = accumulator + product;
+    //                }
+    //            }
+    //        }
+    //        ans[a_idx] = accumulator;
+    //    }
+    //    *self.t_prime_grid.write().unwrap() = Some(ans);
+    //}
 
     fn get_az_bz_at_curr_timestep(
         &self,
@@ -667,36 +984,6 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         }
     }
 
-    fn _bind_extended_grid(&mut self, r: F::Challenge) {
-        let s_ext = self.s_reduced.as_ref().expect("s_reduced should exist");
-        let current_size = s_ext.len();
-        let num_vars = (current_size as f64).log(3.0).round() as usize;
-
-        if num_vars == 0 {
-            return; // Already fully bound
-        }
-
-        let new_size = 3_usize.pow((num_vars - 1) as u32);
-        let mut new_s_ext = vec![F::zero(); new_size];
-
-        // Bind the first variable
-        // For each value of the remaining variables (second_var_eval ∈ {0,1,∞})
-        for second_var_eval in 0..new_size {
-            let idx_0 = second_var_eval; // S(0, second_var_eval)
-            let idx_1 = second_var_eval + new_size; // S(1, second_var_eval)
-            let idx_inf = second_var_eval + 2 * new_size; // S(∞, second_var_eval)
-
-            let val_0 = s_ext[idx_0];
-            let val_1 = s_ext[idx_1];
-            let val_inf = s_ext[idx_inf];
-
-            // Interpolate: f(r) = val_0 * (1-r) + val_1 * r + val_inf * r(r-1)
-            new_s_ext[second_var_eval] =
-                val_0 * (F::one() - r) + val_1 * r + val_inf * r * (r - F::one());
-        }
-
-        self.s_reduced = Some(new_s_ext);
-    }
     pub fn final_sumcheck_evals(&self) -> [F; 2] {
         let az = self.az.as_ref().expect("az should be initialized");
         let bz = self.bz.as_ref().expect("bz should be initialized");
@@ -726,41 +1013,104 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
     )]
     fn compute_prover_message(&mut self, round: usize, previous_claim: F) -> Vec<F> {
         let (t0, t_inf) = if round == 0 {
-            let t_grid = self.get_grid_aux(
+            self.get_grid_aux(
                 &self.split_eq_poly_gen,
                 WINDOW_WIDTH,
                 &self.preprocess,
                 &self.trace,
                 &self.lagrange_evals_r0,
             );
+            let t_grid = self.t_prime_grid.read().unwrap();
+            let grid_ref = t_grid.as_ref().expect("t_grid be initialised by now");
 
-            let E_active = self.split_eq_poly_gen.E_active_current();
-            // Sum over all Z2 values when Z1=0
-            let w_len = self.split_eq_poly_gen.w.len();
-            let t_prime_0 = t_grid[0] * E_active[0] + t_grid[1] * E_active[1];
-            let t_prime_inf = t_grid[6] * E_active[0] + t_grid[7] * E_active[1];
+            // Check what E_active contains
+            let E_active = &self.split_eq_poly_gen.E_active_current();
+            println!("E_active length: {}", E_active.len());
+            println!("E_active values: {:?}", E_active);
 
+            // Manually compute what E_active should be
+            let one = F::one();
+            let expected_e0 =
+                (one - self.split_eq_poly_gen.w[1]) * (one - self.split_eq_poly_gen.w[2]);
+            let expected_e1 = (one - self.split_eq_poly_gen.w[1]) * self.split_eq_poly_gen.w[2];
+            let expected_e2 = self.split_eq_poly_gen.w[1] * (one - self.split_eq_poly_gen.w[2]);
+            let expected_e3 = self.split_eq_poly_gen.w[1] * self.split_eq_poly_gen.w[2];
+
+            // Now compute manual with the grid values
+            let t_prime_0_manual = grid_ref[0] * expected_e0
+                + grid_ref[1] * expected_e1
+                + grid_ref[3] * expected_e2
+                + grid_ref[4] * expected_e3;
+
+            //let t_prime_0 = self.project_to_single_var(grid_ref, E_active, WINDOW_WIDTH, 0);
+            //let t_prime_inf =
+            //    self.project_to_single_var(grid_ref, E_active, WINDOW_WIDTH, INFINITY);
+            //
             let (t0, t_inf) = self.first_round_evals;
-            assert_eq!(t0, t_prime_0);
-            assert_eq!(t_inf, t_prime_inf);
-            (t_prime_0, t_prime_inf)
+            println!("Manual : {:?}\t t_0: {}", t_prime_0_manual, t0);
+            assert_eq!(
+                t0, t_prime_0_manual,
+                "Round {}: t0={:?} != t_prime_0={:?}",
+                round, t0, t_prime_0_manual
+            );
+            //assert_eq!(
+            //    t_inf, t_prime_inf,
+            //    "Round {}: t_inf={:?} != t_prime_inf={:?}",
+            //    round, t0, t_prime_0
+            //);
+
+            (t0, t_inf)
+        } else if round == 1 || round == 2 {
+            println!(
+                "Binding for round {} done; I am in round :{}",
+                round - 1,
+                round
+            );
+            // Here I should have called bind
+            let t_grid = self.t_prime_grid.read().unwrap();
+            let grid_ref = t_grid.as_ref().expect("t_grid be initialised by now");
+            let E_active = &self.split_eq_poly_gen.E_active_current();
+
+            let offset = E_active.len().log_2();
+            let curr_w_idx = self.split_eq_poly_gen.current_index - offset;
+            println!(
+                "Print idx: {:?} Length of E_active : {:?} =? 2",
+                curr_w_idx,
+                1 << offset
+            );
+
+            assert_eq!(
+                E_active[0],
+                (F::one() - self.split_eq_poly.w[curr_w_idx]),
+                "E_active[0] is not right (part a)"
+            );
+
+            let tmp = grid_ref[0] * (F::one() - self.split_eq_poly.w[curr_w_idx])
+                + grid_ref[1] * self.split_eq_poly.w[curr_w_idx];
+            println!("What is tmp: {:?}", tmp);
+            let t_prime_0 = self.project_to_single_var(grid_ref, E_active, WINDOW_WIDTH - round, 0);
+            //let _t_prime_inf =
+            //    self.project_to_single_var(grid_ref, E_active, WINDOW_WIDTH - round, INFINITY);
+            //
+            let (t0, t_inf) = self.remaining_quadratic_evals();
+            assert_eq!(
+                t0, t_prime_0,
+                "Round {}: t0={:?} != t_prime_0={:?}",
+                round, t0, t_prime_0
+            );
+
+            (t0, t_inf)
         } else {
-            if self.params.windows.contains(&round) {
-                println!("Start of window: {:?}; recompute", round);
+            let last_window_start = *self.params.windows.last().unwrap();
+            let last_window_end = last_window_start + WINDOW_WIDTH - 2;
+            if round > last_window_end {
+                println!("Linear sumcheck : TODO! {:?}", round);
+                self.remaining_quadratic_evals()
+            } else {
+                // Case 3: In-between
+                println!("I am in the middle: {:?}", round);
                 let (t0, t_inf) = self.remaining_quadratic_evals();
                 (t0, t_inf)
-            } else {
-                let last_window_start = *self.params.windows.last().unwrap();
-                let last_window_end = last_window_start + WINDOW_WIDTH - 2;
-                if round > last_window_end {
-                    println!("Linear sumcheck : TODO! {:?}", round);
-                    self.remaining_quadratic_evals()
-                } else {
-                    // Case 3: In-between
-                    println!("I am in the middle: {:?}", round);
-                    let (t0, t_inf) = self.remaining_quadratic_evals();
-                    (t0, t_inf)
-                }
             }
         };
 
@@ -771,7 +1121,10 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
             let evals_grid = self
                 .split_eq_poly_gen
                 .gruen_evals_deg_3(t0, t_inf, previous_claim);
+            // THE OTHER EQ STUFF this will be a pain in the butt.
             assert_eq!(evals_grid[0], evals[0]);
+            assert_eq!(evals_grid[1], evals[1]);
+            assert_eq!(evals_grid[2], evals[2]);
         }
         vec![evals[0], evals[1], evals[2]]
     }
@@ -793,6 +1146,12 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
             },
         );
 
+        // Bind
+        if round == 0 || round == 1 || round == 2 {
+            println!("Binding r_{:?}", round);
+            self.bind_first_variable_in_place(r_j, WINDOW_WIDTH - round);
+            self.split_eq_poly_gen.bind(r_j);
+        }
         // Bind eq_poly for next round
         self.split_eq_poly.bind(r_j);
         if round == 1 || self.params.windows.contains(&round) {
@@ -1033,5 +1392,33 @@ impl<F: JoltField> OuterRemainingSumcheckParams<F> {
         let r_tail = sumcheck_challenges;
         let r_full = [&[self.r0_uniskip], r_tail].concat();
         OpeningPoint::<LITTLE_ENDIAN, F>::new(r_full).match_endianness()
+    }
+}
+
+// Add this helper function (not a method)
+fn digitize_standalone(mut i: usize, b: usize, digits: usize) -> Vec<u32> {
+    let mut ans = vec![0u32; digits];
+    for idx in (0..digits).rev() {
+        ans[idx] = (i % b) as u32;
+        i /= b;
+    }
+    ans
+}
+
+#[test]
+fn test_grid_coordinate_logic() {
+    // Now we can test the logic
+    assert_eq!(digitize_standalone(0, 3, 3), vec![0, 0, 0]);
+    assert_eq!(digitize_standalone(1, 3, 3), vec![0, 0, 1]);
+    assert_eq!(digitize_standalone(3, 3, 3), vec![0, 1, 0]);
+    assert_eq!(digitize_standalone(4, 3, 3), vec![0, 1, 1]);
+
+    println!("Coordinate mapping:");
+    for i in 0..9 {
+        let coords = digitize_standalone(i, 3, 3);
+        println!(
+            "  Index {} = z0:{}, z1:{}, z2:{}",
+            i, coords[0], coords[1], coords[2]
+        );
     }
 }
