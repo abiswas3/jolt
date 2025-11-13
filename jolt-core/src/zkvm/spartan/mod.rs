@@ -5,6 +5,7 @@ use crate::poly::commitment::commitment_scheme::CommitmentScheme;
 use crate::poly::opening_proof::{
     OpeningAccumulator, ProverOpeningAccumulator, SumcheckId, VerifierOpeningAccumulator,
 };
+use crate::subprotocols::streaming_schedule::HalfSplitSchedule;
 use crate::subprotocols::sumcheck::UniSkipFirstRoundProof;
 use crate::subprotocols::sumcheck_prover::SumcheckInstanceProver;
 use crate::subprotocols::sumcheck_verifier::SumcheckInstanceVerifier;
@@ -128,8 +129,15 @@ where
         // Stage 1 remainder: outer-remaining
         let mut instances: Vec<Box<dyn SumcheckInstanceProver<F, ProofTranscript>>> = Vec::new();
         if let Some(st) = self.state.uni_skip_state.take() {
+            // \log T
             let n_cycles = self.state.key.num_cycle_vars();
-            let outer_remaining = OuterRemainingSumcheckProver::gen(state_manager, n_cycles, &st);
+            // Now all sumchecks take in a schedule
+            // This is a simple schedule where -- with constant window-size.
+            let schedule = HalfSplitSchedule::new(n_cycles + 1, 3);
+            // accomondating the group index, actual number of rounds is \log T + 1
+            // NOTE: Ask Andrew (or check yourself) if n_cycles was meant to include +1
+            let outer_remaining =
+                OuterRemainingSumcheckProver::gen(state_manager, n_cycles, &st, schedule);
             instances.push(Box::new(outer_remaining));
         }
         instances

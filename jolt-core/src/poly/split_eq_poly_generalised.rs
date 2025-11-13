@@ -206,7 +206,6 @@ impl<F: JoltField> GruenSplitEqPolynomialGeneral<F> {
                 let prod_w_r = self.w[self.current_index] * r;
                 self.current_scalar *=
                     F::one() - self.w[self.current_index] - r + prod_w_r + prod_w_r;
-                // decrement `current_index`
                 println!(
                     "Index being bound: {} Curr index now at: {}",
                     self.current_index,
@@ -217,6 +216,7 @@ impl<F: JoltField> GruenSplitEqPolynomialGeneral<F> {
                 if self.E_active.len() > 1 {
                     self.E_active.pop();
                 } else {
+                    println!("What is the window_size: {}", window_size);
                     // TODO: this is very very inefficient
                     //         curr=13
                     // w16....w0
