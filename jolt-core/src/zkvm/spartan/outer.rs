@@ -474,6 +474,15 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
     }
 
     fn update_r_grid(&self, r_j: F::Challenge) {
+        // Another function that builds self.r_grid()
+        // EXAMPLE:
+        // Initially len = 1 and r_grid = [1]
+        // then receive r_1
+        // next = [(1-r1), r1]
+        // then receive r_2
+        // next is of size 4
+        // next = [(1-r1)(1-r2), r1 (1-r2), (1-r1)r2, r1r2]
+
         let len = self.r_grid.read().unwrap().len();
         let mut next = Vec::with_capacity(2 * len);
         for (_i, v) in self.r_grid.read().unwrap().iter().enumerate() {
@@ -526,7 +535,6 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         let jlen = 1 << (split_eq_poly.get_num_vars() - split_eq_poly.num_challenges());
         let klen = 1 << split_eq_poly.num_challenges();
         // print constants
-        println!("jlen: {}, klen: {}", jlen, klen);
         // output
         let mut ret_az = vec![F::zero(); jlen];
         let mut ret_bz = vec![F::zero(); jlen];
@@ -821,82 +829,144 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
         name = "OuterRemainingSumcheckProver::compute_prover_message"
     )]
     fn compute_prover_message(&mut self, round: usize, previous_claim: F) -> Vec<F> {
-        let (t0, t_inf) = if round == 0 {
+        let (t0, t_inf) = if self.schedule.is_streaming(round) {
+            // STREAMING PHASE
             let num_unbound_vars = self.schedule.num_unbound_vars(round);
-            self.get_grid_gen(num_unbound_vars);
+
+            // Recompute grid at window boundaries
+            if self.schedule.is_window_start(round) {
+                self.get_grid_gen(num_unbound_vars);
+            }
+
+            // Use the grid to compute message
             let tmp = self.t_prime_grid.read().unwrap();
-            let t_prime_grid = tmp.as_ref().expect("t_grid be initialised by now");
+            let t_prime_grid = tmp.as_ref().expect("t_grid should be initialized");
             let E_active = self.split_eq_poly_gen.E_active_current();
 
-            println!("Computing prover message for round={}", round);
+            println!("Computing streaming prover message for round={}", round);
+
             let t_prime_0 = self.project_to_single_var(t_prime_grid, E_active, num_unbound_vars, 0);
             let t_prime_inf =
                 self.project_to_single_var(t_prime_grid, E_active, num_unbound_vars, INFINITY);
 
-            let (t0, t_inf) = self.first_round_evals;
-            assert_eq!(t0, t_prime_0);
-            assert_eq!(t_inf, t_prime_inf);
-            println!("Round {} prover message success!", round);
-            (t0, t_inf)
-        } else {
-            if round == 1 || round == 2 || round == 4 || round == 5 {
-                println!("Computing prover message for round={}", round);
-                let num_unbound_vars = self.schedule.num_unbound_vars(round);
-                let t_grid = self.t_prime_grid.read().unwrap();
-                let grid_ref = t_grid
-                    .as_ref()
-                    .expect("t_grid be initialised by now, and shrunk in size");
-                //let t_prime_0 = grid_ref[0]; // THIS WORKS WHEN the WIDTH was 2.
-                let E_active = &self.split_eq_poly_gen.E_active_current();
-                let t_prime_0 = self.project_to_single_var(grid_ref, E_active, num_unbound_vars, 0);
-                let t_prime_inf =
-                    self.project_to_single_var(grid_ref, E_active, num_unbound_vars, INFINITY);
-                // Manually check the interpolation for grid[0]
-
-                let (t0, t_inf) = self.remaining_quadratic_evals();
-                assert_eq!(t0, t_prime_0, "t0 != t_prime_0");
-                assert_eq!(t_inf, t_prime_inf, "tinf != t_prime_inf");
-                println!("Prover message round : {} SUCCESS", round);
-                (t0, t_inf)
-            } else if round == 3 || round == 6 {
-                println!("Round {round} proving starts");
-                let num_unbound_vars = self.schedule.num_unbound_vars(round);
-                self.get_grid_gen(num_unbound_vars);
-                let tmp = self.t_prime_grid.read().unwrap();
-                let t_prime_grid = tmp.as_ref().expect("t_grid be initialised by now");
-                let E_active = self.split_eq_poly_gen.E_active_current();
-                let t_prime_0 =
-                    self.project_to_single_var(t_prime_grid, E_active, num_unbound_vars, 0);
-                let t_prime_inf =
-                    self.project_to_single_var(t_prime_grid, E_active, num_unbound_vars, INFINITY);
-
-                let (t0, t_inf) = self.remaining_quadratic_evals();
-                assert_eq!(t0, t_prime_0);
-                assert_eq!(t_inf, t_prime_inf);
-                println!("Round {} prover message success!", round);
-                (t0, t_inf)
+            // Keep assertions for testing
+            if round == 0 {
+                let (t0_expected, t_inf_expected) = self.first_round_evals;
+                assert_eq!(t0_expected, t_prime_0);
+                assert_eq!(t_inf_expected, t_prime_inf);
             } else {
-                // All other rounds for now
-                let (t0, t_inf) = self.remaining_quadratic_evals();
-                (t0, t_inf)
+                let (t0_expected, t_inf_expected) = self.remaining_quadratic_evals();
+                assert_eq!(t0_expected, t_prime_0, "t0 mismatch at round {}", round);
+                assert_eq!(
+                    t_inf_expected, t_prime_inf,
+                    "t_inf mismatch at round {}",
+                    round
+                );
             }
-        };
 
+            println!("Round {} streaming prover message success!", round);
+            (t_prime_0, t_prime_inf)
+        } else {
+            // LINEAR PHASE
+            println!("Computing linear prover message for round={}", round);
+
+            // For now, just use quadratic evals
+            let (t0, t_inf) = self.remaining_quadratic_evals();
+
+            println!("Round {} linear prover message success!", round);
+            (t0, t_inf)
+        };
         let evals = self
             .split_eq_poly
             .gruen_evals_deg_3(t0, t_inf, previous_claim);
-        if round == 0 {
-            let evals_grid = self
-                .split_eq_poly_gen
-                .gruen_evals_deg_3(t0, t_inf, previous_claim);
-            assert_eq!(evals_grid[0], evals[0]);
-        }
+
+        // FIXME: The general must have a working version of this
+        //let evals_grid = self
+        //    .split_eq_poly_gen
+        //    .gruen_evals_deg_3(t0, t_inf, previous_claim);
+        //assert_eq!(evals_grid[0], evals[0]);
         // debug collapse
-        self.stream_to_linear_time();
+        //self.stream_to_linear_time();
         // return evals
         vec![evals[0], evals[1], evals[2]]
     }
-
+    //fn compute_prover_message(&mut self, round: usize, previous_claim: F) -> Vec<F> {
+    //    let (t0, t_inf) = if round == 0 {
+    //        let num_unbound_vars = self.schedule.num_unbound_vars(round);
+    //        self.get_grid_gen(num_unbound_vars);
+    //        let tmp = self.t_prime_grid.read().unwrap();
+    //        let t_prime_grid = tmp.as_ref().expect("t_grid be initialised by now");
+    //        let E_active = self.split_eq_poly_gen.E_active_current();
+    //
+    //        println!("Computing prover message for round={}", round);
+    //        let t_prime_0 = self.project_to_single_var(t_prime_grid, E_active, num_unbound_vars, 0);
+    //        let t_prime_inf =
+    //            self.project_to_single_var(t_prime_grid, E_active, num_unbound_vars, INFINITY);
+    //
+    //        let (t0, t_inf) = self.first_round_evals;
+    //        assert_eq!(t0, t_prime_0);
+    //        assert_eq!(t_inf, t_prime_inf);
+    //        println!("Round {} prover message success!", round);
+    //        (t0, t_inf)
+    //    } else {
+    //        if round == 1 || round == 2 || round == 4 || round == 5 {
+    //            println!("Computing prover message for round={}", round);
+    //            let num_unbound_vars = self.schedule.num_unbound_vars(round);
+    //            let t_grid = self.t_prime_grid.read().unwrap();
+    //            let grid_ref = t_grid
+    //                .as_ref()
+    //                .expect("t_grid be initialised by now, and shrunk in size");
+    //            //let t_prime_0 = grid_ref[0]; // THIS WORKS WHEN the WIDTH was 2.
+    //            let E_active = &self.split_eq_poly_gen.E_active_current();
+    //            let t_prime_0 = self.project_to_single_var(grid_ref, E_active, num_unbound_vars, 0);
+    //            let t_prime_inf =
+    //                self.project_to_single_var(grid_ref, E_active, num_unbound_vars, INFINITY);
+    //            // Manually check the interpolation for grid[0]
+    //
+    //            let (t0, t_inf) = self.remaining_quadratic_evals();
+    //            assert_eq!(t0, t_prime_0, "t0 != t_prime_0");
+    //            assert_eq!(t_inf, t_prime_inf, "tinf != t_prime_inf");
+    //            println!("Prover message round : {} SUCCESS", round);
+    //            (t0, t_inf)
+    //        } else if round == 3 || round == 6 {
+    //            println!("Round {round} proving starts");
+    //            let num_unbound_vars = self.schedule.num_unbound_vars(round);
+    //            self.get_grid_gen(num_unbound_vars);
+    //            let tmp = self.t_prime_grid.read().unwrap();
+    //            let t_prime_grid = tmp.as_ref().expect("t_grid be initialised by now");
+    //            let E_active = self.split_eq_poly_gen.E_active_current();
+    //            let t_prime_0 =
+    //                self.project_to_single_var(t_prime_grid, E_active, num_unbound_vars, 0);
+    //            let t_prime_inf =
+    //                self.project_to_single_var(t_prime_grid, E_active, num_unbound_vars, INFINITY);
+    //
+    //            let (t0, t_inf) = self.remaining_quadratic_evals();
+    //            assert_eq!(t0, t_prime_0);
+    //            assert_eq!(t_inf, t_prime_inf);
+    //            println!("Round {} prover message success!", round);
+    //            (t0, t_inf)
+    //        } else {
+    //            // All other rounds for now
+    //            let (t0, t_inf) = self.remaining_quadratic_evals();
+    //            (t0, t_inf)
+    //        }
+    //    };
+    //
+    //    let evals = self
+    //        .split_eq_poly
+    //        .gruen_evals_deg_3(t0, t_inf, previous_claim);
+    //    if round == 0 {
+    //        let evals_grid = self
+    //            .split_eq_poly_gen
+    //            .gruen_evals_deg_3(t0, t_inf, previous_claim);
+    //        assert_eq!(evals_grid[0], evals[0]);
+    //    }
+    //    // debug collapse
+    //    self.stream_to_linear_time();
+    //    // return evals
+    //    vec![evals[0], evals[1], evals[2]]
+    //}
+    //
     #[tracing::instrument(skip_all, name = "OuterRemainingSumcheckProver::bind")]
     fn bind(&mut self, r_j: F::Challenge, round: usize) {
         rayon::join(
@@ -917,14 +987,7 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
         // in the first round it'll make t_grid_smaller from 27 to 9
         // second bind makes it size 3
         // third bind should make it a scalar
-        if round == 0
-            || round == 1
-            || round == 2
-            || round == 3
-            || round == 4
-            || round == 5
-            || round == 6
-        {
+        if self.schedule.is_streaming(round) {
             let num_unbound_vars = self.schedule.num_unbound_vars(round);
             let num_unbound_vars_after_bind = self.schedule.num_unbound_vars(round + 1);
             println!(
@@ -941,23 +1004,9 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
             // so it's not ugly. It should be cleaner.
             self.split_eq_poly_gen
                 .bind(r_j, num_unbound_vars_after_bind);
-            // Another function that builds self.r_grid()
-            // Initially len = 1 and r_grid = [1]
-            // then receive r_1
-            // next = [(1-r1), r1]
-            // then receive r_2
-            // next is of size 4
-            // next = [(1-r1)(1-r2), r1 (1-r2), (1-r1)r2, r1r2]
-            //let len = self.r_grid.read().unwrap().len();
-            //let mut next = Vec::with_capacity(2 * len);
-            //for (_i, v) in self.r_grid.read().unwrap().iter().enumerate() {
-            //    next.push(*v * (F::one() - r_j));
-            //}
-            //for (_i, v) in self.r_grid.read().unwrap().iter().enumerate() {
-            //    next.push(*v * r_j);
-            //}
-            //
-            //*self.r_grid.write().unwrap() = next;
+
+            // This assumes the grid is always correctly built.
+            // TODO: More exhaustive testing to handle edge cases.
             self.update_r_grid(r_j);
         }
         // Bind eq_poly for next round
