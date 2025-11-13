@@ -391,6 +391,7 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
     //    }
     //}
     /// returns the grid of evaluations on 3^window_size
+
     fn get_grid_aux(
         &self,
         split_eq_poly: &GruenSplitEqPolynomialGeneral<F>,
@@ -851,7 +852,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
                 assert_eq!(t_inf, t_prime_inf, "tinf != t_prime_inf");
                 println!("Prover message round : {} SUCCESS", round);
                 (t0, t_inf)
-            } else if round == 4 {
+            } else if round == 3 {
                 println!("By now a new E_active should have been formed");
                 self.get_grid_aux(
                     &self.split_eq_poly_gen,
