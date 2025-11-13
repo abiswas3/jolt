@@ -260,6 +260,7 @@ pub struct OuterRemainingSumcheckProver<F: JoltField> {
     az: Option<DensePolynomial<F>>,
     bz: Option<DensePolynomial<F>>,
     t_prime_grid: RwLock<Option<Vec<F>>>, // Interior mutability for just this field
+    r_grid: RwLock<Vec<F>>,               // Interior mutability for just this field
     /// The first round evals (t0, t_inf) computed from a streaming pass over the trace
     first_round_evals: (F, F),
     #[allocative(skip)]
@@ -327,6 +328,7 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
             az: Some(az_bound), // TB deleted
             bz: Some(bz_bound), // To be deleted
             t_prime_grid: RwLock::new(None),
+            r_grid: RwLock::new(vec![F::one()]),
             first_round_evals: (t0, t_inf),
             params: outer_params,
             lagrange_evals_r0: lagrange_evals_r,
@@ -608,6 +610,8 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         // output
         let mut res = vec![F::zero(); three_pow_dim];
         // main logic
+        println!("E_Out_last_curr_len: {}", split_eq_poly.E_out_current_len());
+        println!("E_In_last_curr_len: {}", split_eq_poly.E_in_current_len());
         for (out_idx, out_val) in split_eq_poly.E_out_current().iter().enumerate() {
             for (in_idx, in_val) in split_eq_poly.E_in_current().iter().enumerate() {
                 let i = out_idx * split_eq_poly.E_in_current_len() + in_idx;
@@ -616,6 +620,14 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                 for j in 0..jlen {
                     for k in 0..klen {
                         let full_idx = k + (j + i * jlen) * klen;
+                        //println!("i: {i} j: {j} k:{k} out_idx: {out_idx} in_idx: {in_idx}| full_idx: {full_idx}");
+                        //println!(
+                        //    "k_len: {} \tj_len: {}\t out_len:{}\tin_len{}",
+                        //    klen,
+                        //    jlen,
+                        //    split_eq_poly.E_out_current_len(),
+                        //    split_eq_poly.E_in_current_len()
+                        //);
                         let current_step_idx = full_idx >> 1;
                         let selector = (full_idx & 1) == 1;
                         let (az, bz) = self.get_az_bz_at_curr_timestep(
@@ -626,14 +638,16 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                             lagrange_evals_r,
                         );
                         if klen > 1 {
-                            // TO DO,
-                            // grid_a[j] += az * something[k]
-                            // grid_a[j] += bz * something[k]
-                            unimplemented!()
+                            // NOTE: check if works
+                            grid_a[j] += az * self.r_grid.read().unwrap()[k];
+                            grid_b[j] += bz * self.r_grid.read().unwrap()[k];
                         } else {
                             grid_a[j] = az;
                             grid_b[j] = bz;
                         }
+                    }
+                    if i == 0 {
+                        assert_eq!(self.az.as_ref().unwrap()[j], grid_a[j]);
                     }
                 }
                 // extrapolate grid_a and grid_b from {0,1}^window_size to {0,1,inf}^window_size
@@ -1003,32 +1017,28 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
                 assert_eq!(t_inf, t_prime_inf, "tinf != t_prime_inf");
                 println!("Prover message round : {} SUCCESS", round);
                 (t0, t_inf)
-            }
-            /*else if round == 4 {
-                println!("By now a new E_active should have been formed");
-                self.get_grid_aux(
+            } else if round == 3 {
+                println!("Round 3 proving starts");
+                self.get_grid_gen(
                     &self.split_eq_poly_gen,
                     WINDOW_WIDTH,
                     &self.preprocess,
                     &self.trace,
                     &self.lagrange_evals_r0,
                 );
-
-                println!("Computing prover message for round={}", round);
                 let tmp = self.t_prime_grid.read().unwrap();
                 let t_prime_grid = tmp.as_ref().expect("t_grid be initialised by now");
                 let E_active = self.split_eq_poly_gen.E_active_current();
-
                 let t_prime_0 = self.project_to_single_var(t_prime_grid, E_active, WINDOW_WIDTH, 0);
                 let t_prime_inf =
                     self.project_to_single_var(t_prime_grid, E_active, WINDOW_WIDTH, INFINITY);
+
                 let (t0, t_inf) = self.remaining_quadratic_evals();
                 assert_eq!(t0, t_prime_0);
                 assert_eq!(t_inf, t_prime_inf);
                 println!("Round {} prover message success!", round);
                 (t0, t_inf)
-            }*/
-            else {
+            } else {
                 // All other rounds for now
                 let (t0, t_inf) = self.remaining_quadratic_evals();
                 (t0, t_inf)
@@ -1070,7 +1080,24 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
         if round == 0 || round == 1 || round == 2 {
             println!("Binding r_{:?}", round);
             self.bind_first_variable_in_place(r_j, WINDOW_WIDTH - round);
-            self.split_eq_poly_gen.bind(r_j, WINDOW_WIDTH - round);
+            self.split_eq_poly_gen.bind(r_j, WINDOW_WIDTH);
+            // Another function that builds self.r_grid()
+            // Initially len = 1 and r_grid = [1]
+            // then receive r_1
+            // next = [(1-r1), r1]
+            // then receive r_2
+            // next is of size 4
+            // next = [(1-r1)(1-r2), r1 (1-r2), (1-r1)r2, r1r2]
+            let len = self.r_grid.read().unwrap().len();
+            let mut next = Vec::with_capacity(2 * len);
+            for (i, v) in self.r_grid.read().unwrap().iter().enumerate() {
+                next.push(*v * (F::one() - r_j));
+            }
+            for (i, v) in self.r_grid.read().unwrap().iter().enumerate() {
+                next.push(*v * r_j);
+            }
+
+            *self.r_grid.write().unwrap() = next;
         }
         // Bind eq_poly for next round
         self.split_eq_poly.bind(r_j);

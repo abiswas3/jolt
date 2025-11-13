@@ -136,6 +136,10 @@ impl<F: JoltField> EqPolynomial<F> {
                 evals[j + 1][i - 1] = scalar - evals[j + 1][i];
             }
         }
+        // Input: w2 w1
+        // [1] <-- Initi
+        // [(1-r1), r1] <-- r1
+        // [(1-r1)(1-r2), (1-r2)r1, r2(1-r1), r1r2] <--r2
         evals
     }
     /// evals_serial_cached but for "high to low" ordering, used specifically in the Gruen x Dao Thaler optimization.
