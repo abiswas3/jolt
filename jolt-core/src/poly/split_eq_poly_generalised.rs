@@ -217,34 +217,34 @@ impl<F: JoltField> GruenSplitEqPolynomialGeneral<F> {
                 if self.E_active.len() > 1 {
                     self.E_active.pop();
                 } else {
+                    // TODO: this is very very inefficient
                     //         curr=13
                     // w16....w0
                     // ACTIVE : w2 w1 w0 // lenght 3
                     // INNER  : w9...w3 // length 7
                     // OUTER  : w16...w10 // length 7
-                    println!("A Fresh E_Active");
                     let remaining_w = &self.w[..self.current_index + 1]; // 14
                     let window_start = remaining_w.len() - window_size; // window_start = 11
 
-                    println!("Remaining_w: {} =? 14", remaining_w.len());
+                    //println!("Remaining_w: {} =? 14", remaining_w.len());
                     let (w_body, w_window) = remaining_w.split_at(window_start);
 
-                    println!("Size of w_window: {}", w_window.len()); //3
-                    println!("Size of w_body: {}", w_body.len()); // 11
+                    //println!("Size of w_window: {}", w_window.len()); //3
+                    //println!("Size of w_body: {}", w_body.len()); // 11
 
                     // w_window = w3, w4, w5
 
                     let (w_active, w_curr_slice) = w_window.split_at(window_size - 1);
                     let _ = w_curr_slice[0]; // The current variable: curr_w3
 
-                    println!("Size of w_active: {}", w_active.len()); // 2
-                                                                      // Split w_body into w_out and w_in
-                                                                      // w_body = w6...w16
+                    //println!("Size of w_active: {}", w_active.len()); // 2
+                    // Split w_body into w_out and w_in
+                    // w_body = w6...w16
                     let m = w_body.len() / 2;
                     let (w_out, w_in) = w_body.split_at(m);
 
-                    println!("Size of w_in: {}", w_in.len());
-                    println!("Size of w_out: {}", w_out.len());
+                    //println!("Size of w_in: {}", w_in.len());
+                    //println!("Size of w_out: {}", w_out.len());
                     // Recompute evaluations
                     let (E_out_vec, rest) = rayon::join(
                         || EqPolynomial::evals_cached(w_out),
@@ -257,7 +257,7 @@ impl<F: JoltField> GruenSplitEqPolynomialGeneral<F> {
                     );
                     let (E_in_vec, E_active) = rest;
 
-                    println!("E_out_last_len: {}", E_out_vec[E_out_vec.len() - 1].len());
+                    //println!("E_out_last_len: {}", E_out_vec[E_out_vec.len() - 1].len());
                     // Update the stored vectors
                     self.E_out_vec = E_out_vec;
                     self.E_in_vec = E_in_vec;
