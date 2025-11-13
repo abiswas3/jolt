@@ -589,16 +589,49 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
         }
     }
 
+    // gets the evaluations of az(x, {0,1}^log(jlen), r)
+    // where x is determined by the bit decomposition of offset
+    // and r is log(klen) variables
+    // this is used both in window computation (jlen is window size)
+    // and in converting to linear time (offset is 0, log(jlen) is the number of unbound variables)
+    fn build_grids(
+        &self,
+        grid_az: &mut Vec<F>,
+        grid_bz: &mut Vec<F>,
+        jlen: usize,
+        klen: usize,
+        offset: usize,
+    ) {
+        let preprocess = &self.preprocess;
+        let trace = &self.trace;
+        let lagrange_evals_r = &self.lagrange_evals_r0;
+        for j in 0..jlen {
+            for k in 0..klen {
+                let full_idx = offset + j * klen + k;
+                let current_step_idx = full_idx >> 1;
+                let selector = (full_idx & 1) == 1;
+                let (az, bz) = self.get_az_bz_at_curr_timestep(
+                    current_step_idx,
+                    selector,
+                    preprocess,
+                    trace,
+                    lagrange_evals_r,
+                );
+                if klen > 1 {
+                    grid_az[j] += az * self.r_grid.read().unwrap()[k];
+                    grid_bz[j] += bz * self.r_grid.read().unwrap()[k];
+                } else {
+                    grid_az[j] = az;
+                    grid_bz[j] = bz;
+                }
+            }
+        }
+    }
+
     // returns the grid of evaluations on {0,1,inf}^window_size
     // touches each cycle of the trace exactly once and in order!
-    fn get_grid_gen(
-        &self,
-        split_eq_poly: &GruenSplitEqPolynomialGeneral<F>,
-        window_size: usize,
-        preprocess: &JoltSharedPreprocessing,
-        trace: &[Cycle],
-        lagrange_evals_r: &[F; OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE],
-    ) {
+    fn get_grid_gen(&self, window_size: usize) {
+        let split_eq_poly = &self.split_eq_poly_gen;
         // helper constants
         let three_pow_dim = 3_usize.pow(window_size as u32);
         let jlen = 1 << window_size;
@@ -615,31 +648,7 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
                 let i = out_idx * split_eq_poly.E_in_current_len() + in_idx;
                 let mut grid_a = vec![F::zero(); jlen];
                 let mut grid_b = vec![F::zero(); jlen];
-                for j in 0..jlen {
-                    for k in 0..klen {
-                        let full_idx = k + (j + i * jlen) * klen;
-                        let current_step_idx = full_idx >> 1;
-                        let selector = (full_idx & 1) == 1;
-                        let (az, bz) = self.get_az_bz_at_curr_timestep(
-                            current_step_idx,
-                            selector,
-                            preprocess,
-                            trace,
-                            lagrange_evals_r,
-                        );
-                        if klen > 1 {
-                            grid_a[j] += az * self.r_grid.read().unwrap()[k];
-                            grid_b[j] += bz * self.r_grid.read().unwrap()[k];
-                        } else {
-                            grid_a[j] = az;
-                            grid_b[j] = bz;
-                        }
-                    }
-                    // sanity check : TODO: remove this
-                    if i == 0 {
-                        assert_eq!(self.az.as_ref().unwrap()[j], grid_a[j]);
-                    }
-                }
+                self.build_grids(&mut grid_a, &mut grid_b, jlen, klen, i * jlen * klen);
                 // extrapolate grid_a and grid_b from {0,1}^window_size to {0,1,inf}^window_size
                 Self::extrapolate_multivariate_1_to_2(&grid_a, &mut buff_a, &mut tmp, window_size);
                 Self::extrapolate_multivariate_1_to_2(&grid_b, &mut buff_b, &mut tmp, window_size);
@@ -650,6 +659,34 @@ impl<F: JoltField> OuterRemainingSumcheckProver<F> {
             }
         }
         *self.t_prime_grid.write().unwrap() = Some(res);
+    }
+
+    // single pass over the trace to compute az and bz for linear time prover
+    fn stream_to_linear_time(&mut self) {
+        let split_eq_poly = &self.split_eq_poly_gen;
+        // helper constants
+        let jlen = 1 << (split_eq_poly.get_num_vars() - split_eq_poly.num_challenges());
+        let klen = 1 << split_eq_poly.num_challenges();
+        // print constants
+        println!("jlen: {}, klen: {}", jlen, klen);
+        // output
+        let mut ret_az = vec![F::zero(); jlen];
+        let mut ret_bz = vec![F::zero(); jlen];
+        self.build_grids(&mut ret_az, &mut ret_bz, jlen, klen, 0);
+        // compare ret_az with self.az to check equality for testing
+        // TODO, remove this block when done testing
+        {
+            let Some(az) = self.az.as_ref() else {
+                panic!("az polynomial not set in streaming to linear time");
+            };
+            // print length of az and length of ret_az
+            println!("{} {}", az.len(), ret_az.len());
+            for (i, v) in az.evals_ref().iter().enumerate() {
+                assert_eq!(*v, ret_az[i], "mismatch in az at index {}", i);
+            }
+        }
+        self.az = Some(DensePolynomial::new(ret_az));
+        self.bz = Some(DensePolynomial::new(ret_bz));
     }
 
     fn get_az_bz_at_curr_timestep(
@@ -924,13 +961,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
     )]
     fn compute_prover_message(&mut self, round: usize, previous_claim: F) -> Vec<F> {
         let (t0, t_inf) = if round == 0 {
-            self.get_grid_gen(
-                &self.split_eq_poly_gen,
-                WINDOW_WIDTH,
-                &self.preprocess,
-                &self.trace,
-                &self.lagrange_evals_r0,
-            );
+            self.get_grid_gen(WINDOW_WIDTH);
             let tmp = self.t_prime_grid.read().unwrap();
             let t_prime_grid = tmp.as_ref().expect("t_grid be initialised by now");
             let E_active = self.split_eq_poly_gen.E_active_current();
@@ -975,13 +1006,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
                 (t0, t_inf)
             } else if round == 3 || round == 6 {
                 println!("Round {round} proving starts");
-                self.get_grid_gen(
-                    &self.split_eq_poly_gen,
-                    WINDOW_WIDTH,
-                    &self.preprocess,
-                    &self.trace,
-                    &self.lagrange_evals_r0,
-                );
+                self.get_grid_gen(WINDOW_WIDTH);
                 let tmp = self.t_prime_grid.read().unwrap();
                 let t_prime_grid = tmp.as_ref().expect("t_grid be initialised by now");
                 let E_active = self.split_eq_poly_gen.E_active_current();
@@ -1010,6 +1035,9 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceProver<F, T> for OuterRemainin
                 .gruen_evals_deg_3(t0, t_inf, previous_claim);
             assert_eq!(evals_grid[0], evals[0]);
         }
+        // debug collapse
+        self.stream_to_linear_time();
+        // return evals
         vec![evals[0], evals[1], evals[2]]
     }
 
