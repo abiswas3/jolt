@@ -27,7 +27,7 @@ pub struct HalfSplitSchedule {
 
 impl HalfSplitSchedule {
     pub fn new(num_rounds: usize, window_width: usize) -> Self {
-        let linear_start = (num_rounds + 1) / 2;
+        let linear_start = num_rounds.div_ceil(2);
 
         let window_starts = (0..linear_start).step_by(window_width).collect();
 

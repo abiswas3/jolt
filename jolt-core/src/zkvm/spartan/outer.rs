@@ -2,7 +2,6 @@ use allocative::Allocative;
 use ark_std::Zero;
 use rayon::prelude::*;
 use std::sync::Arc;
-use std::usize;
 use tracer::instruction::Cycle;
 
 use crate::field::{FMAdd, JoltField, MontgomeryReduce};
@@ -26,6 +25,7 @@ use crate::subprotocols::sumcheck_verifier::SumcheckInstanceVerifier;
 use crate::subprotocols::univariate_skip::{build_uniskip_first_round_poly, UniSkipState};
 use crate::transcripts::Transcript;
 use crate::utils::accumulation::Acc8S;
+use crate::utils::expanding_table::{ExpandingTable, ExpansionOrder};
 use crate::utils::math::Math;
 #[cfg(feature = "allocative")]
 use crate::utils::profiling::print_data_structure_heap_usage;
@@ -259,7 +259,7 @@ pub struct OuterRemainingSumcheckProver<F: JoltField, S: StreamingSchedule> {
     az: Option<DensePolynomial<F>>,
     bz: Option<DensePolynomial<F>>,
     t_prime_poly: Option<MultiquadraticPolynomial<F>>, // multiquadratic polynomial used to answer queries in a streaming window
-    r_grid: Option<Vec<F>>, // hadamard product of (1 - r_j, r_j) for bound variables so far to help with streaming
+    r_grid: ExpandingTable<F>, // hadamard product of (1 - r_j, r_j) for bound variables so far to help with streaming
     /// The first round evals (t0, t_inf) computed from a streaming pass over the trace
     #[allocative(skip)]
     params: OuterRemainingSumcheckParams<F>,
@@ -319,12 +319,11 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
                 sumcheck_mode, // THIS should be based on window schedule
             );
 
-        //let (t0, t_inf, az_bound, bz_bound) = Self::compute_first_quadratic_evals_and_bound_polys(
-        //    &preprocessing.shared,
-        //    trace,
-        //    &lagrange_evals_r,
-        //    &split_eq_poly,
-        //);
+        let mut r_grid = ExpandingTable::new_with_order(
+            1 << num_cycles_bits,
+            ExpansionOrder::MostSignificantBit,
+        );
+        r_grid.reset(F::one());
 
         Self {
             //split_eq_poly,
@@ -334,7 +333,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
             az: None,
             bz: None,
             t_prime_poly: None,
-            r_grid: Some(vec![F::one()]),
+            r_grid,
             params: outer_params,
             lagrange_evals_r0: lagrange_evals_r,
             schedule,
@@ -411,8 +410,8 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
     // and in converting to linear time (offset is 0, log(jlen) is the number of unbound variables)
     fn build_grids(
         &self,
-        grid_az: &mut Vec<F>,
-        grid_bz: &mut Vec<F>,
+        grid_az: &mut [F],
+        grid_bz: &mut [F],
         jlen: usize,
         klen: usize,
         offset: usize,
@@ -420,7 +419,9 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         let preprocess = &self.preprocess;
         let trace = &self.trace;
         let lagrange_evals_r = &self.lagrange_evals_r0;
-        let r_grid = self.r_grid.as_ref().unwrap();
+        let r_grid = &self.r_grid;
+        debug_assert_eq!(klen, r_grid.len());
+
         for j in 0..jlen {
             for k in 0..klen {
                 let full_idx = offset + j * klen + k;
@@ -442,27 +443,6 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
                 }
             }
         }
-    }
-
-    fn update_r_grid(&mut self, r_j: F::Challenge) {
-        // Another function that builds self.r_grid()
-        // EXAMPLE:
-        // Initially len = 1 and r_grid = [1]
-        // then receive r_1
-        // next = [(1-r1), r1]
-        // then receive r_2
-        // next is of size 4
-        // next = [(1-r1)(1-r2), r1 (1-r2), (1-r1)r2, r1r2]
-        let r_grid = self.r_grid.as_mut().unwrap();
-        let len = r_grid.len();
-        let mut next = Vec::with_capacity(2 * len);
-        for (_i, v) in r_grid.iter().enumerate() {
-            next.push(*v * (F::one() - r_j));
-        }
-        for (_i, v) in r_grid.iter().enumerate() {
-            next.push(*v * r_j);
-        }
-        *r_grid = next;
     }
 
     // returns the grid of evaluations on {0,1,inf}^window_size
@@ -489,7 +469,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
                 // extrapolate grid_a and grid_b from {0,1}^window_size to {0,1,inf}^window_size
                 Self::extrapolate_multivariate_1_to_2(&grid_a, &mut buff_a, &mut tmp, window_size);
                 Self::extrapolate_multivariate_1_to_2(&grid_b, &mut buff_b, &mut tmp, window_size);
-                let aux = out_val.clone() * in_val.clone();
+                let aux = *out_val * *in_val;
                 for idx in 0..three_pow_dim {
                     res[idx] += buff_a[idx] * buff_b[idx] * aux;
                 }
@@ -720,7 +700,7 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
                 .as_mut()
                 .expect("t_prime_poly should be initialized");
             t_prime_poly.bind(r_j, BindingOrder::LowToHigh);
-            self.update_r_grid(r_j);
+            self.r_grid.update(r_j);
 
             self.split_eq_poly_gen.bind(r_j, SumCheckMode::STREAMING);
         } else {

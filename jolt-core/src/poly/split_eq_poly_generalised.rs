@@ -24,6 +24,13 @@ pub enum SumCheckMode {
     LINEAR,
 }
 
+type StreamingSplitResult<'a, F> = (
+    &'a [<F as JoltField>::Challenge],
+    &'a [<F as JoltField>::Challenge],
+    &'a [<F as JoltField>::Challenge],
+    usize,
+);
+
 impl<F: JoltField> GruenSplitEqPolynomialGeneral<F> {
     #[tracing::instrument(skip_all, name = "GruenSplitEqPolynomialGeneral::new_with_scaling")]
     pub fn new_with_scaling(
@@ -108,7 +115,7 @@ impl<F: JoltField> GruenSplitEqPolynomialGeneral<F> {
     fn split_for_streaming_lo_to_hi_binding(
         w: &[F::Challenge],
         window_size: usize,
-    ) -> (&[F::Challenge], &[F::Challenge], &[F::Challenge], usize) {
+    ) -> StreamingSplitResult<'_, F> {
         let window_start = w.len() - window_size;
         let (w_body, w_window) = w.split_at(window_start);
         let (w_active, _w_curr) = w_window.split_at(window_size - 1);
@@ -269,11 +276,9 @@ impl<F: JoltField> GruenSplitEqPolynomialGeneral<F> {
         // I need E_out_vec and E_in_vecs to be far less complicated!!
         let E_out_vec_arr = EqPolynomial::evals_serial(w_out, None);
         let E_in_vec_arr = EqPolynomial::evals_serial(w_in, None);
-        let mut E_out_vec = Vec::new();
-        E_out_vec.push(E_out_vec_arr);
+        let E_out_vec = vec![E_out_vec_arr];
 
-        let mut E_in_vec = Vec::new();
-        E_in_vec.push(E_in_vec_arr);
+        let E_in_vec = vec![E_in_vec_arr];
         let E_active = EqPolynomial::evals_cached(w_active);
 
         //println!("E_out_last_len: {}", E_out_vec[E_out_vec.len() - 1].len());

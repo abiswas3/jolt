@@ -110,7 +110,9 @@ impl<F: JoltField> PolynomialBinding<F> for MultiquadraticPolynomial<F> {
             BindingOrder::LowToHigh => self.bind_first_variable(r),
             BindingOrder::HighToLow => {
                 // Not currently needed by the outer Spartan streaming code.
-                unimplemented!("HighToLow binding order is not implemented for MultiquadraticPolynomial")
+                unimplemented!(
+                    "HighToLow binding order is not implemented for MultiquadraticPolynomial"
+                )
             }
         }
     }
