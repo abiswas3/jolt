@@ -440,6 +440,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         }
     }
 
+    fn compute_az_bz_for_linear_sumcheck(&self) {}
     // gets the evaluations of az(x, {0,1}^log(jlen), r)
     // where x is determined by the bit decomposition of offset
     // and r is log(klen) variables
@@ -839,8 +840,14 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
             // STREAMING PHASE
             let num_unbound_vars = self.schedule.num_unbound_vars(round);
 
-            // Recompute grid at window boundaries
+            // At the start of a streaming window
+            // we need to recompute tprime_grid
+            // and recompute what E_active is
             if self.schedule.is_window_start(round) {
+                // NOTE: Important that this get updated first
+                // As this re-computes E_out and E_in
+                self.split_eq_poly_gen
+                    .recompute_eq_polys_for_streaming(num_unbound_vars);
                 self.get_grid_gen(num_unbound_vars);
             }
 
@@ -856,6 +863,9 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
                 self.project_to_single_var(t_prime_grid, E_active, num_unbound_vars, INFINITY);
 
             // Keep assertions for testing
+            // TODO: this distinction will eventually be meaningless under the new API
+            // But in the first round of the linear prover make sure to cache the next round
+            // message
             if round == 0 {
                 let (t0_expected, t_inf_expected) = self.first_round_evals;
                 assert_eq!(t0_expected, t_prime_0);
@@ -875,7 +885,10 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
         } else {
             // LINEAR PHASE
             println!("Computing linear prover message for round={}", round);
-
+            if self.schedule.is_first_linear(round) {
+                // TODO: Recompute things should be here
+                self.split_eq_poly_gen.recompute_eq_polys_for_linear();
+            }
             // For now, just use quadratic evals
             let (t0, t_inf) = self.remaining_quadratic_evals();
 
@@ -975,6 +988,7 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
     //
     #[tracing::instrument(skip_all, name = "OuterRemainingSumcheckProver::bind")]
     fn bind(&mut self, r_j: F::Challenge, round: usize) {
+        // This should only happen in the Linear schedule from now on
         rayon::join(
             || {
                 self.az
@@ -989,34 +1003,18 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
                     .bind_parallel(r_j, BindingOrder::LowToHigh)
             },
         );
-        // Testing special bind
-        // in the first round it'll make t_grid_smaller from 27 to 9
-        // second bind makes it size 3
-        // third bind should make it a scalar
+        self.split_eq_poly.bind(r_j);
+
+        // NEW API
         if self.schedule.is_streaming(round) {
             let num_unbound_vars = self.schedule.num_unbound_vars(round);
-            let num_unbound_vars_after_bind = self.schedule.num_unbound_vars(round + 1);
-            println!(
-                "Binding r_{:?}: Num_vars in grid-before bind: {}",
-                round, num_unbound_vars
-            );
             self.bind_first_variable_in_place(r_j, num_unbound_vars);
-
-            // for this window_width used to be constant
-            // the only time this function needs to know how many
-            // vars are to be bound is when this is the end of the
-            // streaming window and i need split_eq_prepared
-            // but TODO: I will eventually re-structure this
-            // so it's not ugly. It should be cleaner.
-            self.split_eq_poly_gen
-                .bind(r_j, num_unbound_vars_after_bind);
-
-            // This assumes the grid is always correctly built.
-            // TODO: More exhaustive testing to handle edge cases.
             self.update_r_grid(r_j);
+
+            self.split_eq_poly_gen.bind(r_j, SumCheckMode::STREAMING);
+        } else {
+            self.split_eq_poly_gen.bind(r_j, SumCheckMode::LINEAR);
         }
-        // Bind eq_poly for next round
-        self.split_eq_poly.bind(r_j);
     }
 
     fn cache_openings(
