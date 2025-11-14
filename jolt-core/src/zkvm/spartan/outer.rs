@@ -340,11 +340,6 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         }
     }
 
-    /// Compute the window lenght give current round_idx
-    pub fn get_window_with(&self, round_idx: usize) -> usize {
-        round_idx
-    }
-
     // only valid for the initial window
     // given a degree 1 polynomial in dim variables
     // as evaluations over {0,1}^dim
@@ -403,7 +398,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         }
     }
 
-    // gets the evaluations of az(x, {0,1}^log(jlen), r)
+    // gets the evaluations of az(x, {0,1}^log(jlen), r) and bz(x, {0,1}^log(jlen), r)
     // where x is determined by the bit decomposition of offset
     // and r is log(klen) variables
     // this is used both in window computation (jlen is window size)
@@ -453,28 +448,71 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         let three_pow_dim = 3_usize.pow(window_size as u32);
         let jlen = 1 << window_size;
         let klen = 1 << (split_eq_poly.num_challenges());
-        // intermediate buffers
-        let mut buff_a = vec![F::zero(); three_pow_dim];
-        let mut buff_b = vec![F::zero(); three_pow_dim];
-        let mut tmp = vec![F::zero(); three_pow_dim];
-        // output
-        let mut res = vec![F::zero(); three_pow_dim];
-        // main logic
-        for (out_idx, out_val) in split_eq_poly.E_out_current().iter().enumerate() {
-            for (in_idx, in_val) in split_eq_poly.E_in_current().iter().enumerate() {
-                let i = out_idx * split_eq_poly.E_in_current_len() + in_idx;
-                let mut grid_a = vec![F::zero(); jlen];
-                let mut grid_b = vec![F::zero(); jlen];
-                self.build_grids(&mut grid_a, &mut grid_b, jlen, klen, i * jlen * klen);
-                // extrapolate grid_a and grid_b from {0,1}^window_size to {0,1,inf}^window_size
-                Self::extrapolate_multivariate_1_to_2(&grid_a, &mut buff_a, &mut tmp, window_size);
-                Self::extrapolate_multivariate_1_to_2(&grid_b, &mut buff_b, &mut tmp, window_size);
-                let aux = *out_val * *in_val;
-                for idx in 0..three_pow_dim {
-                    res[idx] += buff_a[idx] * buff_b[idx] * aux;
+        let e_out = split_eq_poly.E_out_current();
+        let e_in = split_eq_poly.E_in_current();
+        let e_in_len = split_eq_poly.E_in_current_len();
+
+        // main logic: parallelize outer sum over E_out_current; for each x_out,
+        // perform an inner unreduced accumulation over E_in_current and only
+        // reduce once per grid cell, then multiply by E_out unreduced.
+        let res_unr = e_out
+            .par_iter()
+            .enumerate()
+            .map(|(out_idx, out_val)| {
+                // Local unreduced accumulators for this out_idx
+                let mut local_res_unr =
+                    vec![F::Unreduced::<9>::zero(); three_pow_dim];
+                let mut buff_a = vec![F::zero(); three_pow_dim];
+                let mut buff_b = vec![F::zero(); three_pow_dim];
+                let mut tmp = vec![F::zero(); three_pow_dim];
+
+                for (in_idx, in_val) in e_in.iter().enumerate() {
+                    let i = out_idx * e_in_len + in_idx;
+                    let mut grid_a = vec![F::zero(); jlen];
+                    let mut grid_b = vec![F::zero(); jlen];
+                    self.build_grids(&mut grid_a, &mut grid_b, jlen, klen, i * jlen * klen);
+                    // extrapolate grid_a and grid_b from {0,1}^window_size to {0,1,inf}^window_size
+                    Self::extrapolate_multivariate_1_to_2(
+                        &grid_a,
+                        &mut buff_a,
+                        &mut tmp,
+                        window_size,
+                    );
+                    Self::extrapolate_multivariate_1_to_2(
+                        &grid_b,
+                        &mut buff_b,
+                        &mut tmp,
+                        window_size,
+                    );
+                    let e_in_val = *in_val;
+                    for idx in 0..three_pow_dim {
+                        let val = buff_a[idx] * buff_b[idx];
+                        local_res_unr[idx] += e_in_val.mul_unreduced::<9>(val);
+                    }
                 }
-            }
-        }
+                // Fold in E_out for this x_out
+                let e_out_val = *out_val;
+                for idx in 0..three_pow_dim {
+                    let inner_red = F::from_montgomery_reduce::<9>(local_res_unr[idx]);
+                    local_res_unr[idx] = e_out_val.mul_unreduced::<9>(inner_red);
+                }
+                local_res_unr
+            })
+            .reduce(
+                || vec![F::Unreduced::<9>::zero(); three_pow_dim],
+                |mut acc, local| {
+                    for idx in 0..three_pow_dim {
+                        acc[idx] += local[idx];
+                    }
+                    acc
+                },
+            );
+
+        // Final reduction over all (x_out, x_in)
+        let res: Vec<F> = res_unr
+            .into_iter()
+            .map(|unr| F::from_montgomery_reduce::<9>(unr))
+            .collect();
         self.t_prime_poly = Some(MultiquadraticPolynomial::new(window_size, res));
     }
 
