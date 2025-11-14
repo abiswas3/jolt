@@ -36,6 +36,75 @@ impl<F: JoltField> MultiquadraticPolynomial<F> {
         &self.evals
     }
 
+    /// Given evaluations of a degree-1 multivariate polynomial over {0,1}^dim,
+    /// expand them to the corresponding multiquadratic grid over {0,1,∞}^dim.
+    ///
+    /// The input is a length-2^dim slice `input` containing evaluations on the
+    /// Boolean hypercube. The caller must provide two length-3^dim buffers:
+    /// - `output` will contain the final {0,1,∞}^dim values on return
+    /// - `tmp` is a scratch buffer which this routine may use internally
+    ///
+    /// Layout is product-order with the last variable as the fastest-varying
+    /// coordinate. For each 1D slice (f0, f1) along a new dimension we write
+    /// (f(0), f(1), f(∞)) = (f0, f1, f1 - f0), so ∞ stores the slope.
+    ///
+    /// TODO: special-case dim ∈ {1,2,3} with hand-unrolled code to reduce
+    /// loop overhead on small windows.
+    #[inline(always)]
+    pub fn expand_linear_grid_to_multiquadratic(
+        input: &[F],      // initial buffer (size 2^dim)
+        output: &mut [F], // final buffer (size 3^dim)
+        tmp: &mut [F],    // scratch buffer, also (size 3^dim)
+        dim: usize,
+    ) {
+        // Fill output by expanding one dimension at a time.
+        // We treat slices of increasing "arity"
+
+        // Copy the initial evaluations into the start of either
+        // tmp or output, depending on parity of dim.
+        // We'll alternate between tmp and output as we expand dimensions.
+        let (mut cur, mut next) = if dim % 2 == 1 {
+            tmp[..input.len()].copy_from_slice(input);
+            (tmp, output)
+        } else {
+            output[..input.len()].copy_from_slice(input);
+            (output, tmp)
+        };
+
+        let mut in_stride = 1usize;
+        let in_size = 1 << dim;
+        let mut out_stride = 1usize;
+        let out_size = 3usize.pow(dim as u32);
+        let mut blocks = 1 << (dim - 1);
+
+        // sanity checks
+        assert_eq!(cur.len(), out_size);
+        assert_eq!(next.len(), out_size);
+        assert_eq!(input.len(), in_size);
+
+        // start from the smallest subcubes and expand dimension by dimension
+        for _ in 0..dim {
+            for b in 0..blocks {
+                let in_off = b * 2 * in_stride;
+                let out_off = b * 3 * out_stride;
+
+                for j in 0..in_stride {
+                    // 1d extrapolate
+                    let f0 = cur[in_off + j];
+                    let f1 = cur[in_off + in_stride + j];
+                    next[out_off + j] = f0;
+                    next[out_off + out_stride + j] = f1;
+                    next[out_off + 2 * out_stride + j] = f1 - f0;
+                }
+            }
+            // swap buffers
+            std::mem::swap(&mut cur, &mut next);
+            in_stride *= 3;
+            out_stride *= 3;
+            blocks /= 2;
+        }
+    }
+
     /// Bind the first (least-significant) variable z_0 := r, reducing the
     /// dimension from w to w-1 and keeping the base-3 layout invariant.
     ///

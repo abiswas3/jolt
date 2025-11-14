@@ -340,64 +340,6 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         }
     }
 
-    // only valid for the initial window
-    // given a degree 1 polynomial in dim variables
-    // as evaluations over {0,1}^dim
-    // return evaluations over {0,1,inf}^dim
-    pub fn extrapolate_multivariate_1_to_2(
-        input: &[F],      // initial buffer (size 2^dim)
-        output: &mut [F], // final buffer (size 3^dim)
-        tmp: &mut [F],    // scratch buffer, also (size 3^dim)
-        dim: usize,
-    ) {
-        // Fill output by expanding one dimension at a time.
-        // We treat slices of increasing "arity"
-
-        // Copy the initial evaluations into the start of either
-        // tmp or output, depending on parity of dim.
-        // We'll alternate between tmp and output as we expand dimensions.
-        let (mut cur, mut next) = if dim % 2 == 1 {
-            tmp[..input.len()].copy_from_slice(input);
-            (tmp, output)
-        } else {
-            output[..input.len()].copy_from_slice(input);
-            (output, tmp)
-        };
-
-        let mut in_stride = 1usize;
-        let in_size = 1 << dim;
-        let mut out_stride = 1usize;
-        let out_size = 3usize.pow(dim as u32);
-        let mut blocks = 1 << (dim - 1);
-
-        // sanity checks
-        assert_eq!(cur.len(), out_size);
-        assert_eq!(next.len(), out_size);
-        assert_eq!(input.len(), in_size);
-
-        // start from the smallest subcubes and expand dimension by dimension
-        for _ in 0..dim {
-            for b in 0..blocks {
-                let in_off = b * 2 * in_stride;
-                let out_off = b * 3 * out_stride;
-
-                for j in 0..in_stride {
-                    // 1d extrapolate
-                    let f0 = cur[in_off + j];
-                    let f1 = cur[in_off + in_stride + j];
-                    next[out_off + j] = f0;
-                    next[out_off + out_stride + j] = f1;
-                    next[out_off + 2 * out_stride + j] = f1 - f0;
-                }
-            }
-            // swap buffers
-            std::mem::swap(&mut cur, &mut next);
-            in_stride *= 3;
-            out_stride *= 3;
-            blocks /= 2;
-        }
-    }
-
     // gets the evaluations of az(x, {0,1}^log(jlen), r) and bz(x, {0,1}^log(jlen), r)
     // where x is determined by the bit decomposition of offset
     // and r is log(klen) variables
@@ -462,7 +404,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
                 // Local unreduced accumulators for this out_idx
                 let mut local_res_unr =
                     vec![F::Unreduced::<9>::zero(); three_pow_dim];
-                let mut buff_a = vec![F::zero(); three_pow_dim];
+                let mut buff_a: Vec<F> = vec![F::zero(); three_pow_dim];
                 let mut buff_b = vec![F::zero(); three_pow_dim];
                 let mut tmp = vec![F::zero(); three_pow_dim];
 
@@ -472,13 +414,13 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
                     let mut grid_b = vec![F::zero(); jlen];
                     self.build_grids(&mut grid_a, &mut grid_b, jlen, klen, i * jlen * klen);
                     // extrapolate grid_a and grid_b from {0,1}^window_size to {0,1,inf}^window_size
-                    Self::extrapolate_multivariate_1_to_2(
+                    MultiquadraticPolynomial::<F>::expand_linear_grid_to_multiquadratic(
                         &grid_a,
                         &mut buff_a,
                         &mut tmp,
                         window_size,
                     );
-                    Self::extrapolate_multivariate_1_to_2(
+                    MultiquadraticPolynomial::<F>::expand_linear_grid_to_multiquadratic(
                         &grid_b,
                         &mut buff_b,
                         &mut tmp,
