@@ -1,7 +1,7 @@
 use allocative::Allocative;
 use ark_std::Zero;
 use rayon::prelude::*;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::usize;
 use tracer::instruction::Cycle;
 
@@ -15,7 +15,6 @@ use crate::poly::opening_proof::{
     OpeningAccumulator, OpeningPoint, ProverOpeningAccumulator, SumcheckId,
     VerifierOpeningAccumulator, BIG_ENDIAN, LITTLE_ENDIAN,
 };
-use crate::poly::split_eq_poly::GruenSplitEqPolynomial;
 use crate::poly::split_eq_poly_generalised::{GruenSplitEqPolynomialGeneral, SumCheckMode};
 use crate::poly::unipoly::UniPoly;
 use crate::subprotocols::streaming_schedule::StreamingSchedule;
@@ -259,8 +258,8 @@ pub struct OuterRemainingSumcheckProver<F: JoltField, S: StreamingSchedule> {
     split_eq_poly_gen: GruenSplitEqPolynomialGeneral<F>,
     az: Option<DensePolynomial<F>>,
     bz: Option<DensePolynomial<F>>,
-    t_prime_grid: RwLock<Option<Vec<F>>>, // Interior mutability for just this field
-    r_grid: RwLock<Vec<F>>,               // Interior mutability for just this field
+    t_prime_grid: Option<Vec<F>>, // multivariate polynomial used to answer queries in a streaming window
+    r_grid: Option<Vec<F>>, // hadamard product of (1 - r_j, r_j) for bound variables so far to help with streaming
     /// The first round evals (t0, t_inf) computed from a streaming pass over the trace
     #[allocative(skip)]
     params: OuterRemainingSumcheckParams<F>,
@@ -334,8 +333,8 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
             trace: Arc::new(trace.to_vec()),
             az: None,
             bz: None,
-            t_prime_grid: RwLock::new(None),
-            r_grid: RwLock::new(vec![F::one()]),
+            t_prime_grid: None,
+            r_grid: Some(vec![F::one()]),
             params: outer_params,
             lagrange_evals_r0: lagrange_evals_r,
             schedule,
@@ -348,26 +347,21 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
     }
 
     // TODO: docstrings
-    fn bind_first_variable_in_place(&self, r: F::Challenge, w: usize) {
-        let mut grid_guard = self.t_prime_grid.write().unwrap();
-        if let Some(ref mut t_grid) = *grid_guard {
-            let new_size = 3_usize.pow((w - 1) as u32);
-            let mut t_grid_bound = vec![F::zero(); new_size];
+    fn bind_first_variable_in_place(&mut self, r: F::Challenge, w: usize) {
+        let t_prime_grid = self.t_prime_grid.as_mut().unwrap();
+        let new_size = 3_usize.pow((w - 1) as u32);
+        // For each point in the new (w-1)-dimensional grid
+        for new_idx in 0..new_size {
+            // Since z₀ varies with stride 1 (fastest):
+            let old_base_idx = new_idx * 3;
+            let eval_at_0 = t_prime_grid[old_base_idx]; // z₀ = 0
+            let eval_at_1 = t_prime_grid[old_base_idx + 1]; // z₀ = 1
+            let eval_at_inf = t_prime_grid[old_base_idx + 2]; // z₀ = ∞
 
-            // For each point in the new (w-1)-dimensional grid
-            for new_idx in 0..new_size {
-                // Since z₀ varies with stride 1 (fastest):
-                let old_base_idx = new_idx * 3;
-                let eval_at_0 = t_grid[old_base_idx]; // z₀ = 0
-                let eval_at_1 = t_grid[old_base_idx + 1]; // z₀ = 1
-                let eval_at_inf = t_grid[old_base_idx + 2]; // z₀ = ∞
-
-                // Interpolate and evaluate at r
-                let one = F::one();
-                t_grid_bound[new_idx] =
-                    eval_at_0 * (one - r) + eval_at_1 * r + eval_at_inf * r * (r - one);
-            }
-            *t_grid = t_grid_bound;
+            // Interpolate and evaluate at r
+            let one = F::one();
+            t_prime_grid[new_idx] =
+                eval_at_0 * (one - r) + eval_at_1 * r + eval_at_inf * r * (r - one);
         }
     }
 
@@ -445,6 +439,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         let preprocess = &self.preprocess;
         let trace = &self.trace;
         let lagrange_evals_r = &self.lagrange_evals_r0;
+        let r_grid = self.r_grid.as_ref().unwrap();
         for j in 0..jlen {
             for k in 0..klen {
                 let full_idx = offset + j * klen + k;
@@ -458,8 +453,8 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
                     lagrange_evals_r,
                 );
                 if klen > 1 {
-                    grid_az[j] += az * self.r_grid.read().unwrap()[k];
-                    grid_bz[j] += bz * self.r_grid.read().unwrap()[k];
+                    grid_az[j] += az * r_grid[k];
+                    grid_bz[j] += bz * r_grid[k];
                 } else {
                     grid_az[j] = az;
                     grid_bz[j] = bz;
@@ -468,7 +463,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         }
     }
 
-    fn update_r_grid(&self, r_j: F::Challenge) {
+    fn update_r_grid(&mut self, r_j: F::Challenge) {
         // Another function that builds self.r_grid()
         // EXAMPLE:
         // Initially len = 1 and r_grid = [1]
@@ -477,22 +472,21 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         // then receive r_2
         // next is of size 4
         // next = [(1-r1)(1-r2), r1 (1-r2), (1-r1)r2, r1r2]
-
-        let len = self.r_grid.read().unwrap().len();
+        let r_grid = self.r_grid.as_mut().unwrap();
+        let len = r_grid.len();
         let mut next = Vec::with_capacity(2 * len);
-        for (_i, v) in self.r_grid.read().unwrap().iter().enumerate() {
+        for (_i, v) in r_grid.iter().enumerate() {
             next.push(*v * (F::one() - r_j));
         }
-        for (_i, v) in self.r_grid.read().unwrap().iter().enumerate() {
+        for (_i, v) in r_grid.iter().enumerate() {
             next.push(*v * r_j);
         }
-
-        *self.r_grid.write().unwrap() = next;
+        *r_grid = next;
     }
 
     // returns the grid of evaluations on {0,1,inf}^window_size
     // touches each cycle of the trace exactly once and in order!
-    fn get_grid_gen(&self, window_size: usize) {
+    fn get_grid_gen(&mut self, window_size: usize) {
         let split_eq_poly = &self.split_eq_poly_gen;
         // helper constants
         let three_pow_dim = 3_usize.pow(window_size as u32);
@@ -520,7 +514,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
                 }
             }
         }
-        *self.t_prime_grid.write().unwrap() = Some(res);
+        self.t_prime_grid = Some(res);
     }
 
     // single pass over the trace to compute az and bz for linear time prover
@@ -820,8 +814,10 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
                 self.get_grid_gen(num_unbound_vars);
             }
             // Use the grid to compute message
-            let tmp = self.t_prime_grid.read().unwrap();
-            let t_prime_grid = tmp.as_ref().expect("t_grid should be initialized");
+            let t_prime_grid = self
+                .t_prime_grid
+                .as_ref()
+                .expect("t_grid should be initialized");
             let E_active = self.split_eq_poly_gen.E_active_current();
             let t_prime_0 = self.project_to_single_var(t_prime_grid, E_active, num_unbound_vars, 0);
             let t_prime_inf =
