@@ -16,9 +16,10 @@ use crate::poly::opening_proof::{
     VerifierOpeningAccumulator, BIG_ENDIAN, LITTLE_ENDIAN,
 };
 use crate::poly::split_eq_poly::GruenSplitEqPolynomial;
-use crate::poly::split_eq_poly_generalised::GruenSplitEqPolynomialGeneral;
+use crate::poly::split_eq_poly_generalised::{GruenSplitEqPolynomialGeneral, SumCheckMode};
 use crate::poly::unipoly::UniPoly;
 use crate::subprotocols::streaming_schedule::StreamingSchedule;
+use crate::subprotocols::sumcheck;
 use crate::subprotocols::sumcheck_prover::{
     SumcheckInstanceProver, UniSkipFirstRoundInstanceProver,
 };
@@ -307,7 +308,6 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         // the scaling factor simply multiplyes everyhing
         // with \eq(tau_hi, r_0)
         // internally this stores a Vec<F> of size 2^{\log T + 1}
-        // TODO: This should be merged into one generic one!
         let split_eq_poly: GruenSplitEqPolynomial<F> =
             GruenSplitEqPolynomial::<F>::new_with_scaling(
                 tau_low,
@@ -315,12 +315,18 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
                 Some(lagrange_tau_r0),
             );
 
+        let sumcheck_mode = if schedule.is_streaming(0) {
+            SumCheckMode::STREAMING
+        } else {
+            SumCheckMode::LINEAR
+        };
         let split_eq_poly_gen: GruenSplitEqPolynomialGeneral<F> =
             GruenSplitEqPolynomialGeneral::<F>::new_with_scaling(
                 tau_low,
                 BindingOrder::LowToHigh,
                 Some(lagrange_tau_r0),
                 schedule.num_unbound_vars(0),
+                sumcheck_mode, // THIS should be based on window schedule
             );
 
         // TODO: in the final version we should not hae this.
