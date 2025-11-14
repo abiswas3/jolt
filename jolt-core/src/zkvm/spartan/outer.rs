@@ -255,15 +255,13 @@ pub struct OuterRemainingSumcheckProver<F: JoltField, S: StreamingSchedule> {
     preprocess: Arc<JoltSharedPreprocessing>,
     #[allocative(skip)]
     trace: Arc<Vec<Cycle>>,
-    split_eq_poly: GruenSplitEqPolynomial<F>,
+    //split_eq_poly: GruenSplitEqPolynomial<F>,
     split_eq_poly_gen: GruenSplitEqPolynomialGeneral<F>,
-    // We still have these but their sizes will change
     az: Option<DensePolynomial<F>>,
     bz: Option<DensePolynomial<F>>,
     t_prime_grid: RwLock<Option<Vec<F>>>, // Interior mutability for just this field
     r_grid: RwLock<Vec<F>>,               // Interior mutability for just this field
     /// The first round evals (t0, t_inf) computed from a streaming pass over the trace
-    first_round_evals: (F, F),
     #[allocative(skip)]
     params: OuterRemainingSumcheckParams<F>,
     lagrange_evals_r0: [F; 10],
@@ -291,12 +289,6 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         let tau_high = uni.tau[uni.tau.len() - 1]; // r0 variable
         let tau_low = &uni.tau[..uni.tau.len() - 1]; // includes group index
 
-        assert_eq!(
-            schedule.num_rounds(),
-            tau_low.len(),
-            "Schedule Initialised with the wrong number of rounds."
-        );
-
         // compute eq(tau_hi, r0) where r0 is the challenge from first round
         let lagrange_tau_r0: F = LagrangePolynomial::<F>::lagrange_kernel::<
             F::Challenge,
@@ -307,12 +299,12 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         // the scaling factor simply multiplyes everyhing
         // with \eq(tau_hi, r_0)
         // internally this stores a Vec<F> of size 2^{\log T + 1}
-        let split_eq_poly: GruenSplitEqPolynomial<F> =
-            GruenSplitEqPolynomial::<F>::new_with_scaling(
-                tau_low,
-                BindingOrder::LowToHigh,
-                Some(lagrange_tau_r0),
-            );
+        //let split_eq_poly: GruenSplitEqPolynomial<F> =
+        //    GruenSplitEqPolynomial::<F>::new_with_scaling(
+        //        tau_low,
+        //        BindingOrder::LowToHigh,
+        //        Some(lagrange_tau_r0),
+        //    );
 
         let sumcheck_mode = if schedule.is_streaming(0) {
             SumCheckMode::STREAMING
@@ -328,24 +320,22 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
                 sumcheck_mode, // THIS should be based on window schedule
             );
 
-        // TODO: in the final version we should not hae this.
-        let (t0, t_inf, az_bound, bz_bound) = Self::compute_first_quadratic_evals_and_bound_polys(
-            &preprocessing.shared,
-            trace,
-            &lagrange_evals_r,
-            &split_eq_poly,
-        );
+        //let (t0, t_inf, az_bound, bz_bound) = Self::compute_first_quadratic_evals_and_bound_polys(
+        //    &preprocessing.shared,
+        //    trace,
+        //    &lagrange_evals_r,
+        //    &split_eq_poly,
+        //);
 
         Self {
-            split_eq_poly,
+            //split_eq_poly,
             split_eq_poly_gen,
             preprocess: Arc::new(preprocessing.shared.clone()),
             trace: Arc::new(trace.to_vec()),
-            az: Some(az_bound), // TODO:  deleted
-            bz: Some(bz_bound), // TODO: be deleted
+            az: None,
+            bz: None,
             t_prime_grid: RwLock::new(None),
             r_grid: RwLock::new(vec![F::one()]),
-            first_round_evals: (t0, t_inf), // TODO: To be deleted
             params: outer_params,
             lagrange_evals_r0: lagrange_evals_r,
             schedule,
@@ -539,27 +529,9 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         // helper constants
         let jlen = 1 << (split_eq_poly.get_num_vars() - split_eq_poly.num_challenges());
         let klen = 1 << split_eq_poly.num_challenges();
-        // print constants
-        // output
         let mut ret_az = vec![F::zero(); jlen];
         let mut ret_bz = vec![F::zero(); jlen];
         self.build_grids(&mut ret_az, &mut ret_bz, jlen, klen, 0);
-        // compare ret_az with self.az to check equality for testing
-        // TODO:, remove this block when done testing
-        {
-            let Some(az) = self.az.as_ref() else {
-                panic!("az polynomial not set in streaming to linear time");
-            };
-            // print length of az and length of ret_az
-            println!("{} {}", az.len(), ret_az.len());
-            //for i in az.evals_ref().iter().enumerate() {
-            //    assert_eq!(*v, ret_az[i], "mismatch in az at index {}", i);
-            //}
-            assert_eq!(az.len(), jlen);
-            for i in 0..az.len() {
-                assert_eq!(az[i], ret_az[i], "mismatch in az at index {}", i);
-            }
-        }
         self.az = Some(DensePolynomial::new(ret_az));
         self.bz = Some(DensePolynomial::new(ret_bz));
     }
@@ -586,85 +558,85 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         }
     }
 
-    fn compute_first_quadratic_evals_and_bound_polys(
-        preprocess: &JoltSharedPreprocessing,
-        trace: &[Cycle],
-        lagrange_evals_r: &[F; OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE],
-        split_eq_poly: &GruenSplitEqPolynomial<F>,
-    ) -> (F, F, DensePolynomial<F>, DensePolynomial<F>) {
-        let num_x_out_vals = split_eq_poly.E_out_current_len();
-        let num_x_in_vals = split_eq_poly.E_in_current_len();
-        let iter_num_x_in_vars = num_x_in_vals.log_2();
-        let groups_exact = num_x_out_vals
-            .checked_mul(num_x_in_vals)
-            .expect("overflow computing groups_exact");
-
-        // Preallocate interleaved buffers once ([lo, hi] per entry)
-        let mut az_bound: Vec<F> = unsafe_allocate_zero_vec(2 * groups_exact);
-        let mut bz_bound: Vec<F> = unsafe_allocate_zero_vec(2 * groups_exact);
-
-        // Parallel over x_out groups using exact-sized mutable chunks, with per-worker fold
-        // NOTE: The parallelism is only over the outer evals, and this prevents any false sharing.
-        // Each unit of work is simpy (2\sqrt{T}, 2\sqrt{T}).
-        let (t0_acc_unr, t_inf_acc_unr) = az_bound
-            //.par_chunks_exact_mut(2 * num_x_in_vals)
-            .par_chunks_exact_mut(2 * num_x_in_vals)
-            .zip(bz_bound.par_chunks_exact_mut(2 * num_x_in_vals))
-            .enumerate()
-            .fold(
-                || (F::Unreduced::<9>::zero(), F::Unreduced::<9>::zero()),
-                |(mut acc0, mut acci), (x_out_val, (az_chunk, bz_chunk))| {
-                    let mut inner_sum0 = F::Unreduced::<9>::zero();
-                    let mut inner_sum_inf = F::Unreduced::<9>::zero();
-                    for x_in_val in 0..num_x_in_vals {
-                        // current_step_idx = (x_out_val || x_in_val)
-                        let current_step_idx = (x_out_val << iter_num_x_in_vars) | x_in_val;
-                        let row_inputs =
-                            R1CSCycleInputs::from_trace::<F>(preprocess, trace, current_step_idx);
-                        let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
-                        // This binds r0
-                        let az0 = eval.az_at_r_first_group(lagrange_evals_r);
-                        let bz0 = eval.bz_at_r_first_group(lagrange_evals_r);
-                        let az1 = eval.az_at_r_second_group(lagrange_evals_r);
-                        let bz1 = eval.bz_at_r_second_group(lagrange_evals_r);
-                        let p0 = az0 * bz0;
-                        // Let A(x) and B(x) be the univariate polynomials the prover
-                        // needs to send in round 1 where x is group index variable.
-                        // A(x) = qx + p
-                        // B(x) = tx + s
-                        // A(x)B(x) = tq x^2 + (tp + sq)x + ps
-                        // The leading coeff is
-                        // A(inf)B(inf) = (A(1) - A(0)) * (B(1) - B(0)) = (p + q - p) * (t + s - s) = tq
-                        let slope = (az1 - az0) * (bz1 - bz0);
-                        let e_in = split_eq_poly.E_in_current()[x_in_val];
-                        inner_sum0 += e_in.mul_unreduced::<9>(p0);
-                        inner_sum_inf += e_in.mul_unreduced::<9>(slope);
-                        let off = 2 * x_in_val;
-                        az_chunk[off] = az0;
-                        az_chunk[off + 1] = az1;
-                        bz_chunk[off] = bz0;
-                        bz_chunk[off + 1] = bz1;
-                    }
-                    let e_out = split_eq_poly.E_out_current()[x_out_val];
-                    let reduced0 = F::from_montgomery_reduce::<9>(inner_sum0);
-                    let reduced_inf = F::from_montgomery_reduce::<9>(inner_sum_inf);
-                    acc0 += e_out.mul_unreduced::<9>(reduced0);
-                    acci += e_out.mul_unreduced::<9>(reduced_inf);
-                    (acc0, acci)
-                },
-            )
-            .reduce(
-                || (F::Unreduced::<9>::zero(), F::Unreduced::<9>::zero()),
-                |a, b| (a.0 + b.0, a.1 + b.1),
-            );
-
-        (
-            F::from_montgomery_reduce::<9>(t0_acc_unr),
-            F::from_montgomery_reduce::<9>(t_inf_acc_unr),
-            DensePolynomial::new(az_bound),
-            DensePolynomial::new(bz_bound),
-        )
-    }
+    //fn compute_first_quadratic_evals_and_bound_polys(
+    //    preprocess: &JoltSharedPreprocessing,
+    //    trace: &[Cycle],
+    //    lagrange_evals_r: &[F; OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE],
+    //    split_eq_poly: &GruenSplitEqPolynomial<F>,
+    //) -> (F, F, DensePolynomial<F>, DensePolynomial<F>) {
+    //    let num_x_out_vals = split_eq_poly.E_out_current_len();
+    //    let num_x_in_vals = split_eq_poly.E_in_current_len();
+    //    let iter_num_x_in_vars = num_x_in_vals.log_2();
+    //    let groups_exact = num_x_out_vals
+    //        .checked_mul(num_x_in_vals)
+    //        .expect("overflow computing groups_exact");
+    //
+    //    // Preallocate interleaved buffers once ([lo, hi] per entry)
+    //    let mut az_bound: Vec<F> = unsafe_allocate_zero_vec(2 * groups_exact);
+    //    let mut bz_bound: Vec<F> = unsafe_allocate_zero_vec(2 * groups_exact);
+    //
+    //    // Parallel over x_out groups using exact-sized mutable chunks, with per-worker fold
+    //    // NOTE: The parallelism is only over the outer evals, and this prevents any false sharing.
+    //    // Each unit of work is simpy (2\sqrt{T}, 2\sqrt{T}).
+    //    let (t0_acc_unr, t_inf_acc_unr) = az_bound
+    //        //.par_chunks_exact_mut(2 * num_x_in_vals)
+    //        .par_chunks_exact_mut(2 * num_x_in_vals)
+    //        .zip(bz_bound.par_chunks_exact_mut(2 * num_x_in_vals))
+    //        .enumerate()
+    //        .fold(
+    //            || (F::Unreduced::<9>::zero(), F::Unreduced::<9>::zero()),
+    //            |(mut acc0, mut acci), (x_out_val, (az_chunk, bz_chunk))| {
+    //                let mut inner_sum0 = F::Unreduced::<9>::zero();
+    //                let mut inner_sum_inf = F::Unreduced::<9>::zero();
+    //                for x_in_val in 0..num_x_in_vals {
+    //                    // current_step_idx = (x_out_val || x_in_val)
+    //                    let current_step_idx = (x_out_val << iter_num_x_in_vars) | x_in_val;
+    //                    let row_inputs =
+    //                        R1CSCycleInputs::from_trace::<F>(preprocess, trace, current_step_idx);
+    //                    let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
+    //                    // This binds r0
+    //                    let az0 = eval.az_at_r_first_group(lagrange_evals_r);
+    //                    let bz0 = eval.bz_at_r_first_group(lagrange_evals_r);
+    //                    let az1 = eval.az_at_r_second_group(lagrange_evals_r);
+    //                    let bz1 = eval.bz_at_r_second_group(lagrange_evals_r);
+    //                    let p0 = az0 * bz0;
+    //                    // Let A(x) and B(x) be the univariate polynomials the prover
+    //                    // needs to send in round 1 where x is group index variable.
+    //                    // A(x) = qx + p
+    //                    // B(x) = tx + s
+    //                    // A(x)B(x) = tq x^2 + (tp + sq)x + ps
+    //                    // The leading coeff is
+    //                    // A(inf)B(inf) = (A(1) - A(0)) * (B(1) - B(0)) = (p + q - p) * (t + s - s) = tq
+    //                    let slope = (az1 - az0) * (bz1 - bz0);
+    //                    let e_in = split_eq_poly.E_in_current()[x_in_val];
+    //                    inner_sum0 += e_in.mul_unreduced::<9>(p0);
+    //                    inner_sum_inf += e_in.mul_unreduced::<9>(slope);
+    //                    let off = 2 * x_in_val;
+    //                    az_chunk[off] = az0;
+    //                    az_chunk[off + 1] = az1;
+    //                    bz_chunk[off] = bz0;
+    //                    bz_chunk[off + 1] = bz1;
+    //                }
+    //                let e_out = split_eq_poly.E_out_current()[x_out_val];
+    //                let reduced0 = F::from_montgomery_reduce::<9>(inner_sum0);
+    //                let reduced_inf = F::from_montgomery_reduce::<9>(inner_sum_inf);
+    //                acc0 += e_out.mul_unreduced::<9>(reduced0);
+    //                acci += e_out.mul_unreduced::<9>(reduced_inf);
+    //                (acc0, acci)
+    //            },
+    //        )
+    //        .reduce(
+    //            || (F::Unreduced::<9>::zero(), F::Unreduced::<9>::zero()),
+    //            |a, b| (a.0 + b.0, a.1 + b.1),
+    //        );
+    //
+    //    (
+    //        F::from_montgomery_reduce::<9>(t0_acc_unr),
+    //        F::from_montgomery_reduce::<9>(t_inf_acc_unr),
+    //        DensePolynomial::new(az_bound),
+    //        DensePolynomial::new(bz_bound),
+    //    )
+    //}
     // No special binding path needed; az/bz hold interleaved [lo,hi] ready for binding
 
     /// Compute the polynomial for each of the remaining rounds, using the
@@ -684,7 +656,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
     /// (ordering of indices is MSB to LSB, so x_out is the MSB and x_in is the LSB)
     #[inline]
     fn remaining_quadratic_evals(&self) -> (F, F) {
-        let eq_poly = &self.split_eq_poly;
+        let eq_poly = &self.split_eq_poly_gen;
 
         let n = self.az.as_ref().expect("az should be initialized").len();
         let az = self.az.as_ref().expect("az should be initialized");
@@ -838,12 +810,8 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
     )]
     fn compute_prover_message(&mut self, round: usize, previous_claim: F) -> Vec<F> {
         let (t0, t_inf) = if self.schedule.is_streaming(round) {
-            // STREAMING PHASE
             let num_unbound_vars = self.schedule.num_unbound_vars(round);
 
-            // At the start of a streaming window
-            // we need to recompute tprime_grid
-            // and recompute what E_active is
             if self.schedule.is_window_start(round) {
                 // NOTE: Important that this get updated first
                 // As this re-computes E_out and E_in
@@ -851,41 +819,31 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
                     .recompute_eq_polys_for_streaming(num_unbound_vars);
                 self.get_grid_gen(num_unbound_vars);
             }
-
             // Use the grid to compute message
             let tmp = self.t_prime_grid.read().unwrap();
             let t_prime_grid = tmp.as_ref().expect("t_grid should be initialized");
             let E_active = self.split_eq_poly_gen.E_active_current();
-
-            println!("Computing streaming prover message for round={}", round);
-
             let t_prime_0 = self.project_to_single_var(t_prime_grid, E_active, num_unbound_vars, 0);
             let t_prime_inf =
                 self.project_to_single_var(t_prime_grid, E_active, num_unbound_vars, INFINITY);
 
-            // Keep assertions for testing
-            // TODO: this distinction will eventually be meaningless under the new API
-            // But in the first round of the linear prover make sure to cache the next round
-            // message
-            if round == 0 {
-                let (t0_expected, t_inf_expected) = self.first_round_evals;
-                assert_eq!(t0_expected, t_prime_0);
-                assert_eq!(t_inf_expected, t_prime_inf);
-            } else {
-                let (t0_expected, t_inf_expected) = self.remaining_quadratic_evals();
-                assert_eq!(t0_expected, t_prime_0, "t0 mismatch at round {}", round);
-                assert_eq!(
-                    t_inf_expected, t_prime_inf,
-                    "t_inf mismatch at round {}",
-                    round
-                );
-            }
+            //if round == 0 {
+            //    let (t0_expected, t_inf_expected) = self.first_round_evals;
+            //    assert_eq!(t0_expected, t_prime_0);
+            //    assert_eq!(t_inf_expected, t_prime_inf);
+            //} else {
+            //    let (t0_expected, t_inf_expected) = self.remaining_quadratic_evals();
+            //    assert_eq!(t0_expected, t_prime_0, "t0 mismatch at round {}", round);
+            //    assert_eq!(
+            //        t_inf_expected, t_prime_inf,
+            //        "t_inf mismatch at round {}",
+            //        round
+            //    );
+            //}
 
-            println!("Round {} streaming prover message success!", round);
             (t_prime_0, t_prime_inf)
         } else {
             // LINEAR PHASE
-            println!("Computing linear prover message for round={}", round);
             if self.schedule.is_first_linear(round) {
                 self.split_eq_poly_gen.recompute_eq_polys_for_linear();
                 // This is just a placeholder for now
@@ -894,17 +852,16 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
             }
             // For now, just use quadratic evals
             let (t0, t_inf) = self.remaining_quadratic_evals();
-            println!("Round {} linear prover message success!", round);
             (t0, t_inf)
         };
+        //let evals = self
+        //    .split_eq_poly
+        //    .gruen_evals_deg_3(t0, t_inf, previous_claim);
+        //
         let evals = self
-            .split_eq_poly
-            .gruen_evals_deg_3(t0, t_inf, previous_claim);
-
-        let evals_grid = self
             .split_eq_poly_gen
             .gruen_evals_deg_3(t0, t_inf, previous_claim);
-        assert_eq!(evals_grid[0], evals[0], "Gruen should also work");
+        //assert_eq!(evals_grid[0], evals[0], "Gruen should also work");
         //self.stream_to_linear_time();
         vec![evals[0], evals[1], evals[2]]
     }
@@ -912,21 +869,7 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
     #[tracing::instrument(skip_all, name = "OuterRemainingSumcheckProver::bind")]
     fn bind(&mut self, r_j: F::Challenge, round: usize) {
         // This should only happen in the Linear schedule from now on
-        rayon::join(
-            || {
-                self.az
-                    .as_mut()
-                    .expect("az should be initialised")
-                    .bind_parallel(r_j, BindingOrder::LowToHigh)
-            },
-            || {
-                self.bz
-                    .as_mut()
-                    .expect("bz should be initialised")
-                    .bind_parallel(r_j, BindingOrder::LowToHigh)
-            },
-        );
-        self.split_eq_poly.bind(r_j);
+        //self.split_eq_poly.bind(r_j);
 
         // NEW API
         if self.schedule.is_streaming(round) {
@@ -937,6 +880,20 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
             self.split_eq_poly_gen.bind(r_j, SumCheckMode::STREAMING);
         } else {
             self.split_eq_poly_gen.bind(r_j, SumCheckMode::LINEAR);
+            rayon::join(
+                || {
+                    self.az
+                        .as_mut()
+                        .expect("az should be initialised")
+                        .bind_parallel(r_j, BindingOrder::LowToHigh)
+                },
+                || {
+                    self.bz
+                        .as_mut()
+                        .expect("bz should be initialised")
+                        .bind_parallel(r_j, BindingOrder::LowToHigh)
+                },
+            );
         }
     }
 

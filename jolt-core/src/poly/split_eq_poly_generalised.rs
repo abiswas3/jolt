@@ -297,13 +297,12 @@ impl<F: JoltField> GruenSplitEqPolynomialGeneral<F> {
 
     #[tracing::instrument(skip_all, name = "GruenSplitEqPolynomial::bind")]
     pub fn bind(&mut self, r: F::Challenge, sum_check_mode: SumCheckMode) {
+        self.challenges.push(r);
+        let prod_w_r = self.w[self.current_index] * r;
+        self.current_scalar *= F::one() - self.w[self.current_index] - r + prod_w_r + prod_w_r;
+
         match self.binding_order {
             BindingOrder::LowToHigh => {
-                self.challenges.push(r);
-                let prod_w_r = self.w[self.current_index] * r;
-                self.current_scalar *=
-                    F::one() - self.w[self.current_index] - r + prod_w_r + prod_w_r;
-
                 // Point curr_index at the right thing
                 self.current_index -= 1;
 
@@ -313,9 +312,9 @@ impl<F: JoltField> GruenSplitEqPolynomialGeneral<F> {
                         self.E_active.as_mut().unwrap().pop();
                     }
                     SumCheckMode::LINEAR => {
-                        if self.w.len() / 2 < self.current_index {
+                        if self.E_in_current_len() > 1 {
                             self.E_in_vec.pop();
-                        } else if 0 < self.current_index {
+                        } else {
                             self.E_out_vec.pop();
                         }
                     }
