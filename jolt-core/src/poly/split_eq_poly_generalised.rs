@@ -2,7 +2,7 @@
 //! //! https://eprint.iacr.org/2024/1210.pdf
 
 use super::multilinear_polynomial::BindingOrder;
-use crate::{field::JoltField, poly::eq_poly::EqPolynomial, subprotocols::sumcheck};
+use crate::{field::JoltField, poly::eq_poly::EqPolynomial};
 use allocative::Allocative;
 
 #[derive(Debug, Clone, PartialEq, Allocative)]
