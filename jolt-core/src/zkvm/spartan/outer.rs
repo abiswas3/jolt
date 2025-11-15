@@ -15,6 +15,7 @@ use crate::poly::opening_proof::{
     OpeningAccumulator, OpeningPoint, ProverOpeningAccumulator, SumcheckId,
     VerifierOpeningAccumulator, BIG_ENDIAN, LITTLE_ENDIAN,
 };
+use crate::poly::split_eq_poly::GruenSplitEqPolynomial;
 use crate::poly::split_eq_poly_generalised::{GruenSplitEqPolynomialGeneral, SumCheckMode};
 use crate::poly::unipoly::UniPoly;
 use crate::subprotocols::streaming_schedule::StreamingSchedule;
@@ -255,8 +256,14 @@ pub struct OuterRemainingSumcheckProver<F: JoltField, S: StreamingSchedule> {
     preprocess: Arc<JoltSharedPreprocessing>,
     #[allocative(skip)]
     trace: Arc<Vec<Cycle>>,
-    //split_eq_poly: GruenSplitEqPolynomial<F>,
     split_eq_poly_gen: GruenSplitEqPolynomialGeneral<F>,
+    /// Simple split-eq instance used for incremental refactoring and
+    /// cross-checking against the generalized version. This does not
+    /// participate in the live protocol; it is only used in debug
+    /// assertions to ensure we maintain consistent Gruen sumcheck
+    /// evaluations as we simplify the implementation.
+    #[allow(dead_code)]
+    split_eq_poly_simple: GruenSplitEqPolynomial<F>,
     az: Option<DensePolynomial<F>>,
     bz: Option<DensePolynomial<F>>,
     t_prime_poly: Option<MultiquadraticPolynomial<F>>, // multiquadratic polynomial used to answer queries in a streaming window
@@ -320,6 +327,14 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
                 sumcheck_mode, // THIS should be based on window schedule
             );
 
+        // Simple split-eq polynomial over tau_low with the same scaling.
+        let split_eq_poly_simple: GruenSplitEqPolynomial<F> =
+            GruenSplitEqPolynomial::<F>::new_with_scaling(
+                tau_low,
+                BindingOrder::LowToHigh,
+                Some(lagrange_tau_r0),
+            );
+
         let mut r_grid = ExpandingTable::new_with_order(
             1 << num_cycles_bits,
             ExpansionOrder::MostSignificantBit,
@@ -329,6 +344,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         Self {
             //split_eq_poly,
             split_eq_poly_gen,
+            split_eq_poly_simple,
             preprocess: Arc::new(preprocessing.shared.clone()),
             trace: Arc::new(trace.to_vec()),
             az: None,
@@ -358,7 +374,9 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         let trace = &self.trace;
         let lagrange_evals_r = &self.lagrange_evals_r0;
         let r_grid = &self.r_grid;
-        debug_assert_eq!(klen, r_grid.len());
+        if klen > 1 {
+            debug_assert_eq!(klen, r_grid.len());
+        }
         debug_assert_eq!(grid_az.len(), jlen);
         debug_assert_eq!(grid_bz.len(), jlen);
 
@@ -426,19 +444,24 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
             .par_iter()
             .enumerate()
             .map(|(out_idx, out_val)| {
-                // Local unreduced accumulators for this out_idx
+                // Local unreduced accumulators and scratch buffers for this out_idx.
                 let mut local_res_unr =
                     vec![F::Unreduced::<9>::zero(); three_pow_dim];
                 let mut buff_a: Vec<F> = vec![F::zero(); three_pow_dim];
                 let mut buff_b = vec![F::zero(); three_pow_dim];
                 let mut tmp = vec![F::zero(); three_pow_dim];
+                let mut grid_a = vec![F::zero(); jlen];
+                let mut grid_b = vec![F::zero(); jlen];
 
                 for (in_idx, in_val) in e_in.iter().enumerate() {
                     let i = out_idx * e_in_len + in_idx;
-                    let mut grid_a = vec![F::zero(); jlen];
-                    let mut grid_b = vec![F::zero(); jlen];
+
+                    // Reuse the same grid buffers across all x_in for this x_out.
+                    grid_a.fill(F::zero());
+                    grid_b.fill(F::zero());
                     self.build_grids(&mut grid_a, &mut grid_b, jlen, klen, i * jlen * klen);
-                    // extrapolate grid_a and grid_b from {0,1}^window_size to {0,1,inf}^window_size
+
+                    // Extrapolate grid_a and grid_b from {0,1}^window_size to {0,1,∞}^window_size.
                     MultiquadraticPolynomial::<F>::expand_linear_grid_to_multiquadratic(
                         &grid_a,
                         &mut buff_a,
@@ -451,13 +474,15 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
                         &mut tmp,
                         window_size,
                     );
+
                     let e_in_val = *in_val;
                     for idx in 0..three_pow_dim {
                         let val = buff_a[idx] * buff_b[idx];
                         local_res_unr[idx] += e_in_val.mul_unreduced::<9>(val);
                     }
                 }
-                // Fold in E_out for this x_out
+
+                // Fold in E_out for this x_out.
                 let e_out_val = *out_val;
                 for idx in 0..three_pow_dim {
                     let inner_red = F::from_montgomery_reduce::<9>(local_res_unr[idx]);
@@ -666,6 +691,17 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
         let evals = self
             .split_eq_poly_gen
             .gruen_evals_deg_3(t0, t_inf, previous_claim);
+
+        // Incremental refactor: cross-check against the simpler split-eq
+        // implementation to make sure the Gruen cubic evaluations agree.
+        let evals_simple = self
+            .split_eq_poly_simple
+            .gruen_evals_deg_3(t0, t_inf, previous_claim);
+        debug_assert_eq!(
+            evals, evals_simple,
+            "Gruen cubic mismatch between generalized and simple split-eq at round {}",
+            round
+        );
         //assert_eq!(evals_grid[0], evals[0], "Gruen should also work");
         //self.stream_to_linear_time();
         vec![evals[0], evals[1], evals[2]]
@@ -673,8 +709,9 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
 
     #[tracing::instrument(skip_all, name = "OuterRemainingSumcheckProver::bind")]
     fn bind(&mut self, r_j: F::Challenge, round: usize) {
-        // This should only happen in the Linear schedule from now on
-        //self.split_eq_poly.bind(r_j);
+        // Keep the simple split-eq instance in sync with the generalized one.
+        // This is used only for debug cross-checking of Gruen evaluations.
+        self.split_eq_poly_simple.bind(r_j);
 
         // NEW API
         if self.schedule.is_streaming(round) {

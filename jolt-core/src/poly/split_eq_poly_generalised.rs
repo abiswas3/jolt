@@ -308,8 +308,11 @@ impl<F: JoltField> GruenSplitEqPolynomialGeneral<F> {
 
         match self.binding_order {
             BindingOrder::LowToHigh => {
-                // Point curr_index at the right thing
-                self.current_index -= 1;
+                // Move the cursor "down" one variable, but never below 0. We can
+                // legitimately bind exactly `w.len()` variables over the course
+                // of the outer sumcheck (all bits in `tau_low`), so on the last
+                // round `current_index` will be 0 and must not underflow.
+                self.current_index = self.current_index.saturating_sub(1);
 
                 //otherwise this is fine
                 match sum_check_mode {

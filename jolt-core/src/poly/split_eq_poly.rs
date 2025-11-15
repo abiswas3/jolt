@@ -118,6 +118,109 @@ impl<F: JoltField> GruenSplitEqPolynomial<F> {
         self.E_out_vec.last().map_or(&[], |v| v.as_slice())
     }
 
+    /// Return the (E_out, E_in) tables corresponding to a streaming window of the
+    /// given `window_size`, expressed purely in terms of the cached tables that
+    /// were precomputed in `new_with_scaling`.
+    ///
+    /// The intent is that:
+    /// - for `window_size = 1`, this reduces to the existing split-eq behaviour,
+    ///   i.e. `E_in_window = E_in_current` and `E_out_window = E_out_current`;
+    /// - for larger windows, we "shift" which cached layers we regard as
+    ///   `E_in` and `E_out` without recomputing any equality tables. Intuitively
+    ///   we pull additional unbound variables into the `E_in` side until the
+    ///   window is large enough. This is used only for the streaming grid
+    ///   construction in the Spartan outer sumcheck.
+    ///
+    /// At the moment this is only defined for `BindingOrder::LowToHigh`, which
+    /// is the ordering used in the outer Spartan sumcheck. For `HighToLow` it
+    /// simply falls back to the current (unshifted) tables.
+    ///
+    /// This helper returns owned vectors rather than borrowing from the cached
+    /// tables so that it can correctly represent the "no bits" case as a
+    /// single-entry `[1]` table. This matches the semantics of the equality
+    /// polynomial over zero variables (`eq((), ()) = 1`) and avoids having an
+    /// empty domain, which would incorrectly zero out streaming grids.
+    pub fn E_out_in_for_window(&self, window_size: usize) -> (Vec<F>, Vec<F>) {
+        if window_size == 0 {
+            return (vec![F::one()], vec![F::one()]);
+        }
+
+        match self.binding_order {
+            BindingOrder::LowToHigh => {
+                // In the LowToHigh implementation we maintain two stacks
+                //   - `E_out_vec[j]` is the eq-table for the first `j` bits of `w_out`
+                //   - `E_in_vec[j]`  is the eq-table for the first `j` bits of `w_in`
+                //
+                // `bind` pops from `E_in_vec` first (while there are still "in" bits
+                // left), then from `E_out_vec`. Intuitively, going backwards in
+                // these stacks exposes more unbound variables on the "in" side.
+                //
+                // For a window of size 1 we want to preserve the current behaviour:
+                // `E_in_window = E_in_current`, `E_out_window = E_out_current`.
+                if window_size == 1 {
+                    return (self.E_out_current().to_vec(), self.E_in_current().to_vec());
+                }
+
+                let extra_bits = window_size - 1;
+
+                // How many bits are currently encoded by the top layer of E_in/E_out?
+                // By construction, `E_*_vec.len() = num_bits + 1` and the last entry
+                // has length `2^{num_bits}`.
+                let mut in_bits = if self.E_in_vec.is_empty() {
+                    0
+                } else {
+                    self.E_in_vec.len() - 1
+                };
+                let mut out_bits = if self.E_out_vec.is_empty() {
+                    0
+                } else {
+                    self.E_out_vec.len() - 1
+                };
+
+                // We conceptually "pull" extra_bits variables from the outer side
+                // into the inner side. As long as we still have bits represented
+                // in E_out_vec we reduce `out_bits` and increase `in_bits`. Once
+                // we run out of E_out bits we stop; at that point any further
+                // increase in window size would need information that is not
+                // represented in the cached tables.
+                let mut remaining = extra_bits;
+                while remaining > 0 && out_bits > 0 {
+                    out_bits -= 1;
+                    in_bits += 1;
+                    remaining -= 1;
+                }
+
+                // Clamp to available ranges to avoid panics in edge cases where
+                // the caller asks for a window that is larger than the number of
+                // unbound variables that the cached tables can represent.
+                if out_bits > self.E_out_vec.len().saturating_sub(1) {
+                    out_bits = self.E_out_vec.len().saturating_sub(1);
+                }
+                if in_bits > self.E_in_vec.len().saturating_sub(1) {
+                    in_bits = self.E_in_vec.len().saturating_sub(1);
+                }
+
+                let e_out = if self.E_out_vec.is_empty() {
+                    vec![F::one()]
+                } else {
+                    self.E_out_vec[out_bits].clone()
+                };
+                let e_in = if self.E_in_vec.is_empty() {
+                    vec![F::one()]
+                } else {
+                    self.E_in_vec[in_bits].clone()
+                };
+
+                (e_out, e_in)
+            }
+            BindingOrder::HighToLow => {
+                // Not used in the streaming Spartan prover; fall back to the
+                // current (unshifted) tables for now.
+                (self.E_out_current().to_vec(), self.E_in_current().to_vec())
+            }
+        }
+    }
+
     #[tracing::instrument(skip_all, name = "GruenSplitEqPolynomial::bind")]
     pub fn bind(&mut self, r: F::Challenge) {
         match self.binding_order {
