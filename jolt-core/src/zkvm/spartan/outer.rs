@@ -24,7 +24,8 @@ use crate::subprotocols::sumcheck_prover::{
 use crate::subprotocols::sumcheck_verifier::SumcheckInstanceVerifier;
 use crate::subprotocols::univariate_skip::{build_uniskip_first_round_poly, UniSkipState};
 use crate::transcripts::Transcript;
-use crate::utils::accumulation::Acc8S;
+use crate::utils::accumulation::{Acc5U, Acc6S, Acc7S, Acc8S};
+use crate::field::BarrettReduce;
 use crate::utils::expanding_table::{ExpandingTable, ExpansionOrder};
 use crate::utils::math::Math;
 #[cfg(feature = "allocative")]
@@ -358,27 +359,51 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         let lagrange_evals_r = &self.lagrange_evals_r0;
         let r_grid = &self.r_grid;
         debug_assert_eq!(klen, r_grid.len());
+        debug_assert_eq!(grid_az.len(), jlen);
+        debug_assert_eq!(grid_bz.len(), jlen);
 
-        for j in 0..jlen {
-            for k in 0..klen {
+        // Unreduced accumulators per j for Az and the two Bz groups.
+        let mut acc_az = vec![Acc5U::<F>::zero(); jlen];
+        let mut acc_bz_first = vec![Acc6S::<F>::zero(); jlen];
+        let mut acc_bz_second = vec![Acc7S::<F>::zero(); jlen];
+
+        for k in 0..klen {
+            // Precompute Lagrange weights scaled by the r_grid weight at this k.
+            // Preserve the klen == 1 behaviour of the old code (no r_grid factor).
+            let mut scaled_w = [F::zero(); OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE];
+            if klen > 1 {
+                let weight = r_grid[k];
+                for t in 0..OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE {
+                    scaled_w[t] = lagrange_evals_r[t] * weight;
+                }
+            } else {
+                scaled_w.copy_from_slice(lagrange_evals_r);
+            }
+
+            for j in 0..jlen {
                 let full_idx = offset + j * klen + k;
                 let current_step_idx = full_idx >> 1;
                 let selector = (full_idx & 1) == 1;
-                let (az, bz) = self.get_az_bz_at_curr_timestep(
-                    current_step_idx,
-                    selector,
-                    preprocess,
-                    trace,
-                    lagrange_evals_r,
-                );
-                if klen > 1 {
-                    grid_az[j] += az * r_grid[k];
-                    grid_bz[j] += bz * r_grid[k];
+
+                let row_inputs =
+                    R1CSCycleInputs::from_trace::<F>(preprocess, trace, current_step_idx);
+                let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
+
+                if !selector {
+                    eval.fmadd_first_group_at_r(&scaled_w, &mut acc_az[j], &mut acc_bz_first[j]);
                 } else {
-                    grid_az[j] = az;
-                    grid_bz[j] = bz;
+                    eval.fmadd_second_group_at_r(&scaled_w, &mut acc_az[j], &mut acc_bz_second[j]);
                 }
             }
+        }
+
+        // Final reductions once per j.
+        for j in 0..jlen {
+            let az_j = acc_az[j].barrett_reduce();
+            let bz_first_j = acc_bz_first[j].barrett_reduce();
+            let bz_second_j = acc_bz_second[j].barrett_reduce();
+            grid_az[j] = az_j;
+            grid_bz[j] = bz_first_j + bz_second_j;
         }
     }
 
@@ -469,28 +494,6 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         self.build_grids(&mut ret_az, &mut ret_bz, jlen, klen, 0);
         self.az = Some(DensePolynomial::new(ret_az));
         self.bz = Some(DensePolynomial::new(ret_bz));
-    }
-
-    fn get_az_bz_at_curr_timestep(
-        &self,
-        current_step_idx: usize,
-        selector: bool,
-        preprocess: &JoltSharedPreprocessing,
-        trace: &[Cycle],
-        lagrange_evals_r: &[F; OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE],
-    ) -> (F, F) {
-        let row_inputs = R1CSCycleInputs::from_trace::<F>(preprocess, trace, current_step_idx);
-        let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
-        // This binds r0
-        if !selector {
-            let az0 = eval.az_at_r_first_group(lagrange_evals_r);
-            let bz0 = eval.bz_at_r_first_group(lagrange_evals_r);
-            (az0, bz0)
-        } else {
-            let az1 = eval.az_at_r_second_group(lagrange_evals_r);
-            let bz1 = eval.bz_at_r_second_group(lagrange_evals_r);
-            (az1, bz1)
-        }
     }
 
     /// Compute the polynomial for each of the remaining rounds, using the
