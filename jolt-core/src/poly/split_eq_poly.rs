@@ -451,6 +451,7 @@ impl<F: JoltField> GruenSplitEqPolynomial<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::math::Math;
     use ark_bn254::Fr;
     use ark_std::test_rng;
 
@@ -546,5 +547,79 @@ mod tests {
 
         assert_eq!(indices, (0..indices.len()).collect::<Vec<_>>());
         assert_eq!(regular_eq.Z, coeffs);
+    }
+
+    /// For window_size = 1, `E_out_in_for_window` should reduce to the existing
+    /// split-eq behaviour (`E_out_current`, `E_in_current`) for all rounds.
+    #[test]
+    fn window_size_one_matches_current() {
+        const NUM_VARS: usize = 10;
+        let mut rng = test_rng();
+        let w: Vec<<Fr as JoltField>::Challenge> =
+            std::iter::repeat_with(|| <Fr as JoltField>::Challenge::random(&mut rng))
+                .take(NUM_VARS)
+                .collect();
+
+        let mut split_eq: GruenSplitEqPolynomial<Fr> =
+            GruenSplitEqPolynomial::new(&w, BindingOrder::LowToHigh);
+
+        for _round in 0..NUM_VARS {
+            let (e_out_window, e_in_window) = split_eq.E_out_in_for_window(1);
+            assert_eq!(e_out_window, split_eq.E_out_current());
+            assert_eq!(e_in_window, split_eq.E_in_current());
+
+            let r = <Fr as JoltField>::Challenge::random(&mut rng);
+            split_eq.bind(r);
+        }
+    }
+
+    /// Check basic bit-accounting invariants for `E_out_in_for_window`:
+    ///   log2(|E_out|) + log2(|E_in|) + 1 = number of unbound variables
+    /// for all window sizes and all rounds (LowToHigh).
+    #[test]
+    fn window_bit_accounting_invariants() {
+        const NUM_VARS: usize = 8;
+        let mut rng = test_rng();
+        let w: Vec<<Fr as JoltField>::Challenge> =
+            std::iter::repeat_with(|| <Fr as JoltField>::Challenge::random(&mut rng))
+                .take(NUM_VARS)
+                .collect();
+
+        let mut split_eq: GruenSplitEqPolynomial<Fr> =
+            GruenSplitEqPolynomial::new(&w, BindingOrder::LowToHigh);
+
+        // Walk through all rounds, checking all window sizes that are
+        // meaningful at that point (at least one unbound variable).
+        for _round in 0..NUM_VARS {
+            let num_unbound = split_eq.len().log_2();
+            if num_unbound == 0 {
+                break;
+            }
+
+            for window_size in 1..=num_unbound {
+                let (e_out, e_in) = split_eq.E_out_in_for_window(window_size);
+                // By construction, an "empty" side is represented as a [1] table.
+                debug_assert!(!e_out.is_empty());
+                debug_assert!(!e_in.is_empty());
+
+                let bits_out = e_out.len().log_2();
+                let bits_in = e_in.len().log_2();
+
+                // One bit is reserved for the current variable in the Gruen
+                // cubic (the eq polynomial is linear in that bit).
+                assert_eq!(
+                    bits_out + bits_in + 1,
+                    num_unbound,
+                    "bit accounting failed for window_size={} (bits_out={}, bits_in={}, num_unbound={})",
+                    window_size,
+                    bits_out,
+                    bits_in,
+                    num_unbound,
+                );
+            }
+
+            let r = <Fr as JoltField>::Challenge::random(&mut rng);
+            split_eq.bind(r);
+        }
     }
 }

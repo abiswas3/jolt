@@ -170,17 +170,17 @@ impl<F: JoltField> MultiquadraticPolynomial<F> {
         let inf_inf = a1_inf - a0_inf;
 
         // Layout: index = 3 * enc(x0) + enc(x1), x1 fastest, enc: {0,1,∞} -> {0,1,2}.
-        output[0] = a00;      // (0,0)
-        output[1] = a01;      // (0,1)
-        output[2] = a0_inf;   // (0,∞)
+        output[0] = a00; // (0,0)
+        output[1] = a01; // (0,1)
+        output[2] = a0_inf; // (0,∞)
 
-        output[3] = a10;      // (1,0)
-        output[4] = a11;      // (1,1)
-        output[5] = a1_inf;   // (1,∞)
+        output[3] = a10; // (1,0)
+        output[4] = a11; // (1,1)
+        output[5] = a1_inf; // (1,∞)
 
-        output[6] = inf0;     // (∞,0)
-        output[7] = inf1;     // (∞,1)
-        output[8] = inf_inf;  // (∞,∞)
+        output[6] = inf0; // (∞,0)
+        output[7] = inf1; // (∞,1)
+        output[8] = inf_inf; // (∞,∞)
     }
 
     #[inline(always)]
@@ -247,49 +247,49 @@ impl<F: JoltField> MultiquadraticPolynomial<F> {
         // enc: {0,1,∞} -> {0,1,2}, x2 fastest.
 
         // (x1, x2) = (0, 0)
-        output[0] = h0_0_0;                     // (0,0,0)
-        output[9] = h1_0_0;                     // (1,0,0)
-        output[18] = h1_0_0 - h0_0_0;           // (∞,0,0)
+        output[0] = h0_0_0; // (0,0,0)
+        output[9] = h1_0_0; // (1,0,0)
+        output[18] = h1_0_0 - h0_0_0; // (∞,0,0)
 
         // (0, 1)
-        output[1] = h0_0_1;                     // (0,0,1)
-        output[10] = h1_0_1;                    // (1,0,1)
-        output[19] = h1_0_1 - h0_0_1;           // (∞,0,1)
+        output[1] = h0_0_1; // (0,0,1)
+        output[10] = h1_0_1; // (1,0,1)
+        output[19] = h1_0_1 - h0_0_1; // (∞,0,1)
 
         // (0, ∞)
-        output[2] = h0_0_inf;                   // (0,0,∞)
-        output[11] = h1_0_inf;                  // (1,0,∞)
-        output[20] = h1_0_inf - h0_0_inf;       // (∞,0,∞)
+        output[2] = h0_0_inf; // (0,0,∞)
+        output[11] = h1_0_inf; // (1,0,∞)
+        output[20] = h1_0_inf - h0_0_inf; // (∞,0,∞)
 
         // (1, 0)
-        output[3] = h0_1_0;                     // (0,1,0)
-        output[12] = h1_1_0;                    // (1,1,0)
-        output[21] = h1_1_0 - h0_1_0;           // (∞,1,0)
+        output[3] = h0_1_0; // (0,1,0)
+        output[12] = h1_1_0; // (1,1,0)
+        output[21] = h1_1_0 - h0_1_0; // (∞,1,0)
 
         // (1, 1)
-        output[4] = h0_1_1;                     // (0,1,1)
-        output[13] = h1_1_1;                    // (1,1,1)
-        output[22] = h1_1_1 - h0_1_1;           // (∞,1,1)
+        output[4] = h0_1_1; // (0,1,1)
+        output[13] = h1_1_1; // (1,1,1)
+        output[22] = h1_1_1 - h0_1_1; // (∞,1,1)
 
         // (1, ∞)
-        output[5] = h0_1_inf;                   // (0,1,∞)
-        output[14] = h1_1_inf;                  // (1,1,∞)
-        output[23] = h1_1_inf - h0_1_inf;       // (∞,1,∞)
+        output[5] = h0_1_inf; // (0,1,∞)
+        output[14] = h1_1_inf; // (1,1,∞)
+        output[23] = h1_1_inf - h0_1_inf; // (∞,1,∞)
 
         // (∞, 0)
-        output[6] = h0_inf_0;                   // (0,∞,0)
-        output[15] = h1_inf_0;                  // (1,∞,0)
-        output[24] = h1_inf_0 - h0_inf_0;       // (∞,∞,0)
+        output[6] = h0_inf_0; // (0,∞,0)
+        output[15] = h1_inf_0; // (1,∞,0)
+        output[24] = h1_inf_0 - h0_inf_0; // (∞,∞,0)
 
         // (∞, 1)
-        output[7] = h0_inf_1;                   // (0,∞,1)
-        output[16] = h1_inf_1;                  // (1,∞,1)
-        output[25] = h1_inf_1 - h0_inf_1;       // (∞,∞,1)
+        output[7] = h0_inf_1; // (0,∞,1)
+        output[16] = h1_inf_1; // (1,∞,1)
+        output[25] = h1_inf_1 - h0_inf_1; // (∞,∞,1)
 
         // (∞, ∞)
-        output[8] = h0_inf_inf;                 // (0,∞,∞)
-        output[17] = h1_inf_inf;                // (1,∞,∞)
-        output[26] = h1_inf_inf - h0_inf_inf;   // (∞,∞,∞)
+        output[8] = h0_inf_inf; // (0,∞,∞)
+        output[17] = h1_inf_inf; // (1,∞,∞)
+        output[26] = h1_inf_inf - h0_inf_inf; // (∞,∞,∞)
     }
 
     /// Bind the first (least-significant) variable z_0 := r, reducing the

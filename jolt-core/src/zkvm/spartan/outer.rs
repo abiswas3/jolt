@@ -4,6 +4,7 @@ use rayon::prelude::*;
 use std::sync::Arc;
 use tracer::instruction::Cycle;
 
+use crate::field::BarrettReduce;
 use crate::field::{FMAdd, JoltField, MontgomeryReduce};
 use crate::poly::commitment::commitment_scheme::CommitmentScheme;
 use crate::poly::dense_mlpoly::DensePolynomial;
@@ -26,7 +27,6 @@ use crate::subprotocols::sumcheck_verifier::SumcheckInstanceVerifier;
 use crate::subprotocols::univariate_skip::{build_uniskip_first_round_poly, UniSkipState};
 use crate::transcripts::Transcript;
 use crate::utils::accumulation::{Acc5U, Acc6S, Acc7S, Acc8S};
-use crate::field::BarrettReduce;
 use crate::utils::expanding_table::{ExpandingTable, ExpansionOrder};
 use crate::utils::math::Math;
 #[cfg(feature = "allocative")]
@@ -283,7 +283,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         uni: &UniSkipState<F>,
         schedule: S,
     ) -> Self {
-        let (preprocessing, _, trace, _program_io, _final_mem) = state_manager.get_prover_data();
+        let (preprocessing, _, _trace, _program_io, _final_mem) = state_manager.get_prover_data();
 
         let outer_params = OuterRemainingSumcheckParams::new(num_cycles_bits, uni);
 
@@ -346,7 +346,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
             split_eq_poly_gen,
             split_eq_poly_simple,
             preprocess: Arc::new(preprocessing.shared.clone()),
-            trace: Arc::new(trace.to_vec()),
+            trace: state_manager.get_trace_arc(),
             az: None,
             bz: None,
             t_prime_poly: None,
@@ -427,6 +427,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
 
     // returns the grid of evaluations on {0,1,inf}^window_size
     // touches each cycle of the trace exactly once and in order!
+    #[tracing::instrument(skip_all, name = "OuterRemainingSumcheckProver::get_grid_gen")]
     fn get_grid_gen(&mut self, window_size: usize) {
         let split_eq_poly = &self.split_eq_poly_gen;
         // helper constants
@@ -445,8 +446,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
             .enumerate()
             .map(|(out_idx, out_val)| {
                 // Local unreduced accumulators and scratch buffers for this out_idx.
-                let mut local_res_unr =
-                    vec![F::Unreduced::<9>::zero(); three_pow_dim];
+                let mut local_res_unr = vec![F::Unreduced::<9>::zero(); three_pow_dim];
                 let mut buff_a: Vec<F> = vec![F::zero(); three_pow_dim];
                 let mut buff_b = vec![F::zero(); three_pow_dim];
                 let mut tmp = vec![F::zero(); three_pow_dim];
@@ -509,6 +509,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
     }
 
     // single pass over the trace to compute az and bz for linear time prover
+    #[tracing::instrument(skip_all, name = "OuterRemainingSumcheckProver::stream_to_linear_time")]
     fn stream_to_linear_time(&mut self) {
         let split_eq_poly = &self.split_eq_poly_gen;
         // helper constants
@@ -684,27 +685,20 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
             let (t0, t_inf) = self.remaining_quadratic_evals();
             (t0, t_inf)
         };
-        //let evals = self
-        //    .split_eq_poly
-        //    .gruen_evals_deg_3(t0, t_inf, previous_claim);
-        //
-        let evals = self
-            .split_eq_poly_gen
-            .gruen_evals_deg_3(t0, t_inf, previous_claim);
-
-        // Incremental refactor: cross-check against the simpler split-eq
-        // implementation to make sure the Gruen cubic evaluations agree.
+        // Compute the Gruen cubic using the simple split-eq implementation,
+        // and cross-check against the generalized version for now.
         let evals_simple = self
             .split_eq_poly_simple
             .gruen_evals_deg_3(t0, t_inf, previous_claim);
+        let evals_gen = self
+            .split_eq_poly_gen
+            .gruen_evals_deg_3(t0, t_inf, previous_claim);
         debug_assert_eq!(
-            evals, evals_simple,
+            evals_simple, evals_gen,
             "Gruen cubic mismatch between generalized and simple split-eq at round {}",
             round
         );
-        //assert_eq!(evals_grid[0], evals[0], "Gruen should also work");
-        //self.stream_to_linear_time();
-        vec![evals[0], evals[1], evals[2]]
+        vec![evals_simple[0], evals_simple[1], evals_simple[2]]
     }
 
     #[tracing::instrument(skip_all, name = "OuterRemainingSumcheckProver::bind")]
