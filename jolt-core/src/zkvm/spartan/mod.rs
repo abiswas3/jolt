@@ -5,7 +5,7 @@ use crate::poly::commitment::commitment_scheme::CommitmentScheme;
 use crate::poly::opening_proof::{
     OpeningAccumulator, ProverOpeningAccumulator, SumcheckId, VerifierOpeningAccumulator,
 };
-use crate::subprotocols::streaming_schedule::IncreasingWindowSchedule;
+use crate::subprotocols::streaming_schedule::LinearOnlySchedule;
 use crate::subprotocols::sumcheck::UniSkipFirstRoundProof;
 use crate::subprotocols::sumcheck_prover::SumcheckInstanceProver;
 use crate::subprotocols::sumcheck_verifier::SumcheckInstanceVerifier;
@@ -131,10 +131,10 @@ where
         if let Some(st) = self.state.uni_skip_state.take() {
             // \log T
             let n_cycles = self.state.key.num_cycle_vars();
-            // Now all sumchecks take in a schedule. Use an increasing-streaming
-            // schedule with window sizes 1,2,3,..., truncated so that the total
-            // number of streaming rounds is still roughly half.
-            let schedule = IncreasingWindowSchedule::new(n_cycles + 1);
+            // Now all sumchecks take in a schedule. For strict linear-time mode
+            // (no streaming windows), use a LinearOnlySchedule over all rounds.
+            // For experiments with streaming, swap this to IncreasingWindowSchedule.
+            let schedule = LinearOnlySchedule::new(n_cycles + 1);
             // accomondating the group index, actual number of rounds is \log T + 1
             // NOTE: Ask Andrew (or check yourself) if n_cycles was meant to include +1
             let outer_remaining =

@@ -150,6 +150,45 @@ impl StreamingSchedule for IncreasingWindowSchedule {
     }
 }
 
+/// A schedule that disables streaming and runs all sumcheck rounds in
+/// the linear-time mode.
+#[derive(Debug, Clone, Allocative)]
+pub struct LinearOnlySchedule {
+    num_rounds: usize,
+}
+
+impl LinearOnlySchedule {
+    pub fn new(num_rounds: usize) -> Self {
+        Self { num_rounds }
+    }
+}
+
+impl StreamingSchedule for LinearOnlySchedule {
+    fn is_streaming(&self, _round: usize) -> bool {
+        false
+    }
+
+    fn is_window_start(&self, _round: usize) -> bool {
+        false
+    }
+
+    fn is_first_linear(&self, round: usize) -> bool {
+        round == 0
+    }
+
+    fn num_rounds(&self) -> usize {
+        self.num_rounds
+    }
+
+    fn num_unbound_vars(&self, round: usize) -> usize {
+        if round >= self.num_rounds {
+            0
+        } else {
+            self.num_rounds - round
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
