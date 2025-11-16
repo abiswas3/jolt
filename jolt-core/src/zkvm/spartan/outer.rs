@@ -17,7 +17,6 @@ use crate::poly::opening_proof::{
     VerifierOpeningAccumulator, BIG_ENDIAN, LITTLE_ENDIAN,
 };
 use crate::poly::split_eq_poly::GruenSplitEqPolynomial;
-use crate::poly::split_eq_poly_generalised::{GruenSplitEqPolynomialGeneral, SumCheckMode};
 use crate::poly::unipoly::UniPoly;
 use crate::subprotocols::streaming_schedule::StreamingSchedule;
 use crate::subprotocols::sumcheck_prover::{
@@ -256,14 +255,9 @@ pub struct OuterRemainingSumcheckProver<F: JoltField, S: StreamingSchedule> {
     preprocess: Arc<JoltSharedPreprocessing>,
     #[allocative(skip)]
     trace: Arc<Vec<Cycle>>,
-    split_eq_poly_gen: GruenSplitEqPolynomialGeneral<F>,
-    /// Simple split-eq instance used for incremental refactoring and
-    /// cross-checking against the generalized version. This does not
-    /// participate in the live protocol; it is only used in debug
-    /// assertions to ensure we maintain consistent Gruen sumcheck
-    /// evaluations as we simplify the implementation.
-    #[allow(dead_code)]
-    split_eq_poly_simple: GruenSplitEqPolynomial<F>,
+    /// Split-eq instance used for both streaming and linear phases of the
+    /// outer Spartan sumcheck over cycle variables.
+    split_eq_poly: GruenSplitEqPolynomial<F>,
     az: Option<DensePolynomial<F>>,
     bz: Option<DensePolynomial<F>>,
     t_prime_poly: Option<MultiquadraticPolynomial<F>>, // multiquadratic polynomial used to answer queries in a streaming window
@@ -313,22 +307,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         //        Some(lagrange_tau_r0),
         //    );
 
-        let sumcheck_mode = if schedule.is_streaming(0) {
-            SumCheckMode::STREAMING
-        } else {
-            SumCheckMode::LINEAR
-        };
-        let split_eq_poly_gen: GruenSplitEqPolynomialGeneral<F> =
-            GruenSplitEqPolynomialGeneral::<F>::new_with_scaling(
-                tau_low,
-                BindingOrder::LowToHigh,
-                Some(lagrange_tau_r0),
-                schedule.num_unbound_vars(0),
-                sumcheck_mode, // THIS should be based on window schedule
-            );
-
-        // Simple split-eq polynomial over tau_low with the same scaling.
-        let split_eq_poly_simple: GruenSplitEqPolynomial<F> =
+        let split_eq_poly: GruenSplitEqPolynomial<F> =
             GruenSplitEqPolynomial::<F>::new_with_scaling(
                 tau_low,
                 BindingOrder::LowToHigh,
@@ -342,9 +321,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         r_grid.reset(F::one());
 
         Self {
-            //split_eq_poly,
-            split_eq_poly_gen,
-            split_eq_poly_simple,
+            split_eq_poly,
             preprocess: Arc::new(preprocessing.shared.clone()),
             trace: state_manager.get_trace_arc(),
             az: None,
@@ -429,14 +406,19 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
     // touches each cycle of the trace exactly once and in order!
     #[tracing::instrument(skip_all, name = "OuterRemainingSumcheckProver::get_grid_gen")]
     fn get_grid_gen(&mut self, window_size: usize) {
-        let split_eq_poly = &self.split_eq_poly_gen;
+        // Use the split-eq instance to derive the current window
+        // factorisation of Eq over the unbound cycle bits. This keeps the
+        // semantics in one place (see `split_eq_poly::E_out_in_for_window`).
+        let split_eq = &self.split_eq_poly;
+
         // helper constants
         let three_pow_dim = 3_usize.pow(window_size as u32);
         let jlen = 1 << window_size;
-        let klen = 1 << (split_eq_poly.num_challenges());
-        let e_out = split_eq_poly.E_out_current();
-        let e_in = split_eq_poly.E_in_current();
-        let e_in_len = split_eq_poly.E_in_current_len();
+        let klen = 1 << split_eq.num_challenges();
+
+        // Head-factor eq tables for this window.
+        let (e_out, e_in) = split_eq.E_out_in_for_window(window_size);
+        let e_in_len = e_in.len();
 
         // main logic: parallelize outer sum over E_out_current; for each x_out,
         // perform an inner unreduced accumulation over E_in_current and only
@@ -511,7 +493,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
     // single pass over the trace to compute az and bz for linear time prover
     #[tracing::instrument(skip_all, name = "OuterRemainingSumcheckProver::stream_to_linear_time")]
     fn stream_to_linear_time(&mut self) {
-        let split_eq_poly = &self.split_eq_poly_gen;
+        let split_eq_poly = &self.split_eq_poly;
         // helper constants
         let jlen = 1 << (split_eq_poly.get_num_vars() - split_eq_poly.num_challenges());
         let klen = 1 << split_eq_poly.num_challenges();
@@ -539,7 +521,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
     /// (ordering of indices is MSB to LSB, so x_out is the MSB and x_in is the LSB)
     #[inline]
     fn remaining_quadratic_evals(&self) -> (F, F) {
-        let eq_poly = &self.split_eq_poly_gen;
+        let eq_poly = &self.split_eq_poly;
 
         let n = self.az.as_ref().expect("az should be initialized").len();
         let az = self.az.as_ref().expect("az should be initialized");
@@ -643,10 +625,9 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
             let num_unbound_vars = self.schedule.num_unbound_vars(round);
 
             if self.schedule.is_window_start(round) {
-                // NOTE: Important that this get updated first
-                // As this re-computes E_out and E_in
-                self.split_eq_poly_gen
-                    .recompute_eq_polys_for_streaming(num_unbound_vars);
+                // Build the multiquadratic t'(z) for this window using the
+                // slice-based Eq factorisation provided by the simple
+                // split-eq instance (head vs window bits).
                 self.get_grid_gen(num_unbound_vars);
             }
             // Use the multiquadratic polynomial to compute the message
@@ -654,9 +635,12 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
                 .t_prime_poly
                 .as_ref()
                 .expect("t_prime_poly should be initialized");
-            let E_active = self.split_eq_poly_gen.E_active_current();
-            let t_prime_0 = t_prime_poly.project_to_first_variable(E_active, 0);
-            let t_prime_inf = t_prime_poly.project_to_first_variable(E_active, INFINITY);
+            // Equality weights over the active window bits (all but the first).
+            let e_active = self
+                .split_eq_poly
+                .E_active_for_window(num_unbound_vars);
+            let t_prime_0 = t_prime_poly.project_to_first_variable(&e_active, 0);
+            let t_prime_inf = t_prime_poly.project_to_first_variable(&e_active, INFINITY);
 
             //if round == 0 {
             //    let (t0_expected, t_inf_expected) = self.first_round_evals;
@@ -676,38 +660,24 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
         } else {
             // LINEAR PHASE
             if self.schedule.is_first_linear(round) {
-                self.split_eq_poly_gen.recompute_eq_polys_for_linear();
-                // This is just a placeholder for now
                 self.stream_to_linear_time();
-                //let (_t0, _t_inf) = self.compute_az_bz_for_linear_sumcheck();
             }
             // For now, just use quadratic evals
             let (t0, t_inf) = self.remaining_quadratic_evals();
             (t0, t_inf)
         };
-        // Compute the Gruen cubic using the simple split-eq implementation,
-        // and cross-check against the generalized version for now.
-        let evals_simple = self
-            .split_eq_poly_simple
+        // Compute the Gruen cubic using the split-eq implementation.
+        let evals = self
+            .split_eq_poly
             .gruen_evals_deg_3(t0, t_inf, previous_claim);
-        let evals_gen = self
-            .split_eq_poly_gen
-            .gruen_evals_deg_3(t0, t_inf, previous_claim);
-        debug_assert_eq!(
-            evals_simple, evals_gen,
-            "Gruen cubic mismatch between generalized and simple split-eq at round {}",
-            round
-        );
-        vec![evals_simple[0], evals_simple[1], evals_simple[2]]
+        vec![evals[0], evals[1], evals[2]]
     }
 
     #[tracing::instrument(skip_all, name = "OuterRemainingSumcheckProver::bind")]
     fn bind(&mut self, r_j: F::Challenge, round: usize) {
-        // Keep the simple split-eq instance in sync with the generalized one.
-        // This is used only for debug cross-checking of Gruen evaluations.
-        self.split_eq_poly_simple.bind(r_j);
+        // Bind the split-eq instance in lock-step with the outer sumcheck.
+        self.split_eq_poly.bind(r_j);
 
-        // NEW API
         if self.schedule.is_streaming(round) {
             let t_prime_poly = self
                 .t_prime_poly
@@ -715,10 +685,7 @@ impl<F: JoltField, T: Transcript, S: StreamingSchedule> SumcheckInstanceProver<F
                 .expect("t_prime_poly should be initialized");
             t_prime_poly.bind(r_j, BindingOrder::LowToHigh);
             self.r_grid.update(r_j);
-
-            self.split_eq_poly_gen.bind(r_j, SumCheckMode::STREAMING);
         } else {
-            self.split_eq_poly_gen.bind(r_j, SumCheckMode::LINEAR);
             rayon::join(
                 || {
                     self.az

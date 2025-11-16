@@ -27,6 +27,9 @@ pub struct GruenSplitEqPolynomial<F: JoltField> {
     pub(crate) w: Vec<F::Challenge>,
     pub(crate) E_in_vec: Vec<Vec<F>>,
     pub(crate) E_out_vec: Vec<Vec<F>>,
+    /// Cached `[1]` table used to represent eq over zero variables when a side
+    /// (head, inner, or active) has no bits.
+    one_table: Vec<F>,
     pub(crate) binding_order: BindingOrder,
 }
 
@@ -52,12 +55,14 @@ impl<F: JoltField> GruenSplitEqPolynomial<F> {
                     || EqPolynomial::evals_cached(w_out),
                     || EqPolynomial::evals_cached(w_in),
                 );
+                let one_table = vec![F::one()];
                 Self {
                     current_index: w.len(),
                     current_scalar: scaling_factor.unwrap_or(F::one()),
                     w: w.to_vec(),
                     E_in_vec,
                     E_out_vec,
+                    one_table,
                     binding_order,
                 }
             }
@@ -72,6 +77,7 @@ impl<F: JoltField> GruenSplitEqPolynomial<F> {
                     || EqPolynomial::evals_cached_rev(w_in),
                     || EqPolynomial::evals_cached_rev(w_out),
                 );
+                let one_table = vec![F::one()];
 
                 Self {
                     current_index: 0, // Start from 0 for high-to-low up to w.len() - 1
@@ -79,6 +85,7 @@ impl<F: JoltField> GruenSplitEqPolynomial<F> {
                     w: w.to_vec(),
                     E_in_vec,
                     E_out_vec,
+                    one_table,
                     binding_order,
                 }
             }
@@ -97,6 +104,16 @@ impl<F: JoltField> GruenSplitEqPolynomial<F> {
         match self.binding_order {
             BindingOrder::LowToHigh => 1 << self.current_index,
             BindingOrder::HighToLow => 1 << (self.w.len() - self.current_index),
+        }
+    }
+
+    /// Number of variables that have already been bound into `current_scalar`.
+    /// For LowToHigh this is `w.len() - current_index`; for HighToLow it is
+    /// `current_index`.
+    pub fn num_challenges(&self) -> usize {
+        match self.binding_order {
+            BindingOrder::LowToHigh => self.w.len() - self.current_index,
+            BindingOrder::HighToLow => self.current_index,
         }
     }
 
@@ -119,104 +136,124 @@ impl<F: JoltField> GruenSplitEqPolynomial<F> {
     }
 
     /// Return the (E_out, E_in) tables corresponding to a streaming window of the
-    /// given `window_size`, expressed purely in terms of the cached tables that
-    /// were precomputed in `new_with_scaling`.
+    /// given `window_size`, using an explicit slice-based factorisation of the
+    /// current unbound variables.
     ///
-    /// The intent is that:
-    /// - for `window_size = 1`, this reduces to the existing split-eq behaviour,
-    ///   i.e. `E_in_window = E_in_current` and `E_out_window = E_out_current`;
-    /// - for larger windows, we "shift" which cached layers we regard as
-    ///   `E_in` and `E_out` without recomputing any equality tables. Intuitively
-    ///   we pull additional unbound variables into the `E_in` side until the
-    ///   window is large enough. This is used only for the streaming grid
-    ///   construction in the Spartan outer sumcheck.
+    /// Semantics (LowToHigh):
+    /// - Let `num_unbound = current_index` and `remaining_w = w[..num_unbound]`.
+    /// - For a window of size `window_size >= 1`, define:
+    ///     - `w_window` as the last `window_size` bits of `remaining_w`
+    ///     - `w_head`   as the prefix before `w_window`
+    ///     - within `w_window`, the last bit is the current Gruen variable and the
+    ///       preceding `window_size - 1` bits are the "active" window bits
+    /// - This function returns eq tables over `w_head`, split into two halves
+    ///   `w_out` and `w_in`:
+    ///     - `w_head = [w_out || w_in]` with `w_out` = first `⌊|w_head| / 2⌋` bits
+    ///   so that
+    ///     - `eq(w_head, (x_out, x_in)) = E_out[x_out] * E_in[x_in]`.
     ///
-    /// At the moment this is only defined for `BindingOrder::LowToHigh`, which
-    /// is the ordering used in the outer Spartan sumcheck. For `HighToLow` it
-    /// simply falls back to the current (unshifted) tables.
+    /// The active window bits are handled separately by [`E_active_for_window`].
+    /// Together they satisfy, for `BindingOrder::LowToHigh`,
+    ///   log2(|E_out|) + log2(|E_in|) + log2(|E_active|) + 1 = #unbound bits,
+    /// where the final `+ 1` accounts for the current linear Gruen bit.
     ///
-    /// This helper returns owned vectors rather than borrowing from the cached
-    /// tables so that it can correctly represent the "no bits" case as a
-    /// single-entry `[1]` table. This matches the semantics of the equality
-    /// polynomial over zero variables (`eq((), ()) = 1`) and avoids having an
-    /// empty domain, which would incorrectly zero out streaming grids.
-    pub fn E_out_in_for_window(&self, window_size: usize) -> (Vec<F>, Vec<F>) {
+    /// This helper returns slices and represents "no head bits" as
+    /// single-entry `[1]` tables, matching `eq((), ()) = 1`.
+    pub fn E_out_in_for_window(&self, window_size: usize) -> (&[F], &[F]) {
         if window_size == 0 {
-            return (vec![F::one()], vec![F::one()]);
+            return (&self.one_table, &self.one_table);
         }
 
         match self.binding_order {
             BindingOrder::LowToHigh => {
-                // In the LowToHigh implementation we maintain two stacks
-                //   - `E_out_vec[j]` is the eq-table for the first `j` bits of `w_out`
-                //   - `E_in_vec[j]`  is the eq-table for the first `j` bits of `w_in`
-                //
-                // `bind` pops from `E_in_vec` first (while there are still "in" bits
-                // left), then from `E_out_vec`. Intuitively, going backwards in
-                // these stacks exposes more unbound variables on the "in" side.
-                //
-                // For a window of size 1 we want to preserve the current behaviour:
-                // `E_in_window = E_in_current`, `E_out_window = E_out_current`.
-                if window_size == 1 {
-                    return (self.E_out_current().to_vec(), self.E_in_current().to_vec());
+                let num_unbound = self.current_index;
+                if num_unbound == 0 {
+                    return (&self.one_table, &self.one_table);
                 }
 
-                let extra_bits = window_size - 1;
+                // Restrict window size to the actually available unbound bits.
+                let window_size = core::cmp::min(window_size, num_unbound);
+                let head_len = num_unbound.saturating_sub(window_size);
+                if head_len == 0 {
+                    // No head bits: represent as eq over zero vars.
+                    return (&self.one_table, &self.one_table);
+                }
 
-                // How many bits are currently encoded by the top layer of E_in/E_out?
-                // By construction, `E_*_vec.len() = num_bits + 1` and the last entry
-                // has length `2^{num_bits}`.
-                let mut in_bits = if self.E_in_vec.is_empty() {
-                    0
+                // The head prefix consists of the earliest `head_len` bits of `w`.
+                // These live entirely in the original `[w_out || w_in] = w[..n-1]`
+                // region, so we can factor them via prefixes of `w_out` and `w_in`.
+                let n = self.w.len();
+                let m = n / 2;
+
+                let head_out_bits = core::cmp::min(head_len, m);
+                let head_in_bits = head_len.saturating_sub(head_out_bits);
+
+                let e_out = if head_out_bits == 0 {
+                    &self.one_table
                 } else {
-                    self.E_in_vec.len() - 1
+                    debug_assert!(
+                        head_out_bits < self.E_out_vec.len(),
+                        "head_out_bits={} E_out_vec.len()={}",
+                        head_out_bits,
+                        self.E_out_vec.len()
+                    );
+                    &self.E_out_vec[head_out_bits]
                 };
-                let mut out_bits = if self.E_out_vec.is_empty() {
-                    0
+                let e_in = if head_in_bits == 0 {
+                    &self.one_table
                 } else {
-                    self.E_out_vec.len() - 1
-                };
-
-                // We conceptually "pull" extra_bits variables from the outer side
-                // into the inner side. As long as we still have bits represented
-                // in E_out_vec we reduce `out_bits` and increase `in_bits`. Once
-                // we run out of E_out bits we stop; at that point any further
-                // increase in window size would need information that is not
-                // represented in the cached tables.
-                let mut remaining = extra_bits;
-                while remaining > 0 && out_bits > 0 {
-                    out_bits -= 1;
-                    in_bits += 1;
-                    remaining -= 1;
-                }
-
-                // Clamp to available ranges to avoid panics in edge cases where
-                // the caller asks for a window that is larger than the number of
-                // unbound variables that the cached tables can represent.
-                if out_bits > self.E_out_vec.len().saturating_sub(1) {
-                    out_bits = self.E_out_vec.len().saturating_sub(1);
-                }
-                if in_bits > self.E_in_vec.len().saturating_sub(1) {
-                    in_bits = self.E_in_vec.len().saturating_sub(1);
-                }
-
-                let e_out = if self.E_out_vec.is_empty() {
-                    vec![F::one()]
-                } else {
-                    self.E_out_vec[out_bits].clone()
-                };
-                let e_in = if self.E_in_vec.is_empty() {
-                    vec![F::one()]
-                } else {
-                    self.E_in_vec[in_bits].clone()
+                    debug_assert!(
+                        head_in_bits < self.E_in_vec.len(),
+                        "head_in_bits={} E_in_vec.len()={}",
+                        head_in_bits,
+                        self.E_in_vec.len()
+                    );
+                    &self.E_in_vec[head_in_bits]
                 };
 
                 (e_out, e_in)
             }
             BindingOrder::HighToLow => {
-                // Not used in the streaming Spartan prover; fall back to the
-                // current (unshifted) tables for now.
-                (self.E_out_current().to_vec(), self.E_in_current().to_vec())
+                // Streaming windows are not defined for HighToLow in the current
+                // Spartan code paths; return neutral head tables.
+                (&self.one_table, &self.one_table)
+            }
+        }
+    }
+
+    /// Return the equality table over the "active" window bits (all but the
+    /// last variable in the current streaming window). This is used when
+    /// projecting the multiquadratic t'(z_0, ..., z_{w-1}) down to a univariate
+    /// in the first variable by summing against eq(tau_active, ·) over the
+    /// remaining coordinates.
+    ///
+    /// We derive the active slice directly from the unbound portion of `w`.
+    /// For LowToHigh binding, the unbound variables are `w[..current_index]`;
+    /// the last `window_size` of these belong to the current window, and all
+    /// but the final one are "active".
+    pub fn E_active_for_window(&self, window_size: usize) -> Vec<F> {
+        if window_size <= 1 {
+            // No active bits in a size-0/1 window; eq over zero vars is [1].
+            return vec![F::one()];
+        }
+
+        match self.binding_order {
+            BindingOrder::LowToHigh => {
+                let num_unbound = self.current_index;
+                if window_size > num_unbound {
+                    // Clamp to the maximum meaningful window size at this round.
+                    return vec![F::one()];
+                }
+                let remaining_w = &self.w[..num_unbound];
+                let window_start = remaining_w.len() - window_size;
+                let (_w_body, w_window) = remaining_w.split_at(window_start);
+                let (w_active, _w_curr_slice) = w_window.split_at(window_size - 1);
+                // We only need the full eq table over the active window bits.
+                EqPolynomial::<F>::evals(w_active)
+            }
+            BindingOrder::HighToLow => {
+                // Not used for the outer Spartan streaming code.
+                vec![F::one()]
             }
         }
     }
@@ -549,8 +586,8 @@ mod tests {
         assert_eq!(regular_eq.Z, coeffs);
     }
 
-    /// For window_size = 1, `E_out_in_for_window` should reduce to the existing
-    /// split-eq behaviour (`E_out_current`, `E_in_current`) for all rounds.
+    /// For window_size = 1, `E_out_in_for_window` should factor the eq polynomial
+    /// over the head bits `w[..current_index-1]` into a product of two tables.
     #[test]
     fn window_size_one_matches_current() {
         const NUM_VARS: usize = 10;
@@ -564,17 +601,42 @@ mod tests {
             GruenSplitEqPolynomial::new(&w, BindingOrder::LowToHigh);
 
         for _round in 0..NUM_VARS {
+            let num_unbound = split_eq.current_index;
+            if num_unbound <= 1 {
+                break;
+            }
+
+            // Factor head = w[..num_unbound-1] into (E_out, E_in).
             let (e_out_window, e_in_window) = split_eq.E_out_in_for_window(1);
-            assert_eq!(e_out_window, split_eq.E_out_current());
-            assert_eq!(e_in_window, split_eq.E_in_current());
+            let w_head = &split_eq.w[..num_unbound - 1];
+            let head_evals = EqPolynomial::evals(w_head);
+
+            let num_x_out = e_out_window.len();
+            let num_x_in = e_in_window.len();
+            assert_eq!(num_x_out * num_x_in, head_evals.len());
+
+            let x_in_bits = num_x_in.log_2();
+            for x_out in 0..num_x_out {
+                for x_in in 0..num_x_in {
+                    let idx = (x_out << x_in_bits) | x_in;
+                    assert_eq!(
+                        e_out_window[x_out] * e_in_window[x_in],
+                        head_evals[idx],
+                        "factorisation mismatch at round={}, x_out={}, x_in={}",
+                        _round,
+                        x_out,
+                        x_in
+                    );
+                }
+            }
 
             let r = <Fr as JoltField>::Challenge::random(&mut rng);
             split_eq.bind(r);
         }
     }
 
-    /// Check basic bit-accounting invariants for `E_out_in_for_window`:
-    ///   log2(|E_out|) + log2(|E_in|) + 1 = number of unbound variables
+    /// Check basic bit-accounting invariants for the streaming factorisation:
+    ///   log2(|E_out|) + log2(|E_in|) + log2(|E_active|) + 1 = number of unbound variables
     /// for all window sizes and all rounds (LowToHigh).
     #[test]
     fn window_bit_accounting_invariants() {
@@ -598,22 +660,26 @@ mod tests {
 
             for window_size in 1..=num_unbound {
                 let (e_out, e_in) = split_eq.E_out_in_for_window(window_size);
-                // By construction, an "empty" side is represented as a [1] table.
+                let e_active = split_eq.E_active_for_window(window_size);
+                // By construction, each side represents at least one entry.
                 debug_assert!(!e_out.is_empty());
                 debug_assert!(!e_in.is_empty());
+                debug_assert!(!e_active.is_empty());
 
                 let bits_out = e_out.len().log_2();
                 let bits_in = e_in.len().log_2();
+                let bits_active = e_active.len().log_2();
 
                 // One bit is reserved for the current variable in the Gruen
                 // cubic (the eq polynomial is linear in that bit).
                 assert_eq!(
-                    bits_out + bits_in + 1,
+                    bits_out + bits_in + bits_active + 1,
                     num_unbound,
-                    "bit accounting failed for window_size={} (bits_out={}, bits_in={}, num_unbound={})",
+                    "bit accounting failed for window_size={} (bits_out={}, bits_in={}, bits_active={}, num_unbound={})",
                     window_size,
                     bits_out,
                     bits_in,
+                    bits_active,
                     num_unbound,
                 );
             }
