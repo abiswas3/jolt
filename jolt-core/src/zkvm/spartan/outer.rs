@@ -296,17 +296,6 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
             OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE,
         >(&uni.r0, &tau_high);
 
-        // Note: tau_lo contains both time vars and group index
-        // the scaling factor simply multiplyes everyhing
-        // with \eq(tau_hi, r_0)
-        // internally this stores a Vec<F> of size 2^{\log T + 1}
-        //let split_eq_poly: GruenSplitEqPolynomial<F> =
-        //    GruenSplitEqPolynomial::<F>::new_with_scaling(
-        //        tau_low,
-        //        BindingOrder::LowToHigh,
-        //        Some(lagrange_tau_r0),
-        //    );
-
         let split_eq_poly: GruenSplitEqPolynomial<F> =
             GruenSplitEqPolynomial::<F>::new_with_scaling(
                 tau_low,
@@ -346,6 +335,7 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         jlen: usize,
         klen: usize,
         offset: usize,
+        parallel: bool,
     ) {
         let preprocess = &self.preprocess;
         let trace = &self.trace;
@@ -362,34 +352,91 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         let mut acc_bz_first = vec![Acc6S::<F>::zero(); jlen];
         let mut acc_bz_second = vec![Acc7S::<F>::zero(); jlen];
 
-        for k in 0..klen {
-            // Precompute Lagrange weights scaled by the r_grid weight at this k.
-            // Preserve the klen == 1 behaviour of the old code (no r_grid factor).
-            let mut scaled_w = [F::zero(); OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE];
-            if klen > 1 {
-                let weight = r_grid[k];
-                for t in 0..OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE {
-                    scaled_w[t] = lagrange_evals_r[t] * weight;
-                }
-            } else {
-                scaled_w.copy_from_slice(lagrange_evals_r);
-            }
-
-            for j in 0..jlen {
-                let full_idx = offset + j * klen + k;
-                let current_step_idx = full_idx >> 1;
-                let selector = (full_idx & 1) == 1;
-
-                let row_inputs =
-                    R1CSCycleInputs::from_trace::<F>(preprocess, trace, current_step_idx);
-                let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
-
-                if !selector {
-                    eval.fmadd_first_group_at_r(&scaled_w, &mut acc_az[j], &mut acc_bz_first[j]);
+        if !parallel {
+            // Original sequential traversal: iterate over k first to preserve
+            // the streaming access pattern used in `get_grid_gen`.
+            for k in 0..klen {
+                // Precompute Lagrange weights scaled by the r_grid weight at this k.
+                // Preserve the klen == 1 behaviour of the old code (no r_grid factor).
+                let mut scaled_w = [F::zero(); OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE];
+                if klen > 1 {
+                    let weight = r_grid[k];
+                    for t in 0..OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE {
+                        scaled_w[t] = lagrange_evals_r[t] * weight;
+                    }
                 } else {
-                    eval.fmadd_second_group_at_r(&scaled_w, &mut acc_az[j], &mut acc_bz_second[j]);
+                    scaled_w.copy_from_slice(lagrange_evals_r);
+                }
+
+                for j in 0..jlen {
+                    let full_idx = offset + j * klen + k;
+                    let current_step_idx = full_idx >> 1;
+                    let selector = (full_idx & 1) == 1;
+
+                    let row_inputs =
+                        R1CSCycleInputs::from_trace::<F>(preprocess, trace, current_step_idx);
+                    let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
+
+                    if !selector {
+                        eval.fmadd_first_group_at_r(
+                            &scaled_w,
+                            &mut acc_az[j],
+                            &mut acc_bz_first[j],
+                        );
+                    } else {
+                        eval.fmadd_second_group_at_r(
+                            &scaled_w,
+                            &mut acc_az[j],
+                            &mut acc_bz_second[j],
+                        );
+                    }
                 }
             }
+        } else {
+            // Parallel traversal over j for the linear-time prover.
+            // Each worker owns disjoint accumulators for a fixed j, so there
+            // are no data races. We recompute the scaled Lagrange weights per
+            // (j, k); this is cheap compared to the R1CS row evaluation.
+            acc_az
+                .par_iter_mut()
+                .zip(acc_bz_first.par_iter_mut())
+                .zip(acc_bz_second.par_iter_mut())
+                .enumerate()
+                .for_each(|(j, ((acc_az_j, acc_bz_first_j), acc_bz_second_j))| {
+                    let mut scaled_w = [F::zero(); OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE];
+                    for k in 0..klen {
+                        if klen > 1 {
+                            let weight = r_grid[k];
+                            for t in 0..OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE {
+                                scaled_w[t] = lagrange_evals_r[t] * weight;
+                            }
+                        } else {
+                            scaled_w.copy_from_slice(lagrange_evals_r);
+                        }
+
+                        let full_idx = offset + j * klen + k;
+                        let current_step_idx = full_idx >> 1;
+                        let selector = (full_idx & 1) == 1;
+
+                        let row_inputs =
+                            R1CSCycleInputs::from_trace::<F>(preprocess, trace, current_step_idx);
+                        let eval = R1CSEval::<F>::from_cycle_inputs(&row_inputs);
+
+                        if !selector {
+                            eval.fmadd_first_group_at_r(
+                                &scaled_w,
+                                acc_az_j,
+                                acc_bz_first_j,
+                            );
+                        } else {
+                            eval.fmadd_second_group_at_r(
+                                &scaled_w,
+                                acc_az_j,
+                                acc_bz_second_j,
+                            );
+                        }
+                    }
+                });
         }
 
         // Final reductions once per j.
@@ -441,7 +488,8 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
                     // Reuse the same grid buffers across all x_in for this x_out.
                     grid_a.fill(F::zero());
                     grid_b.fill(F::zero());
-                    self.build_grids(&mut grid_a, &mut grid_b, jlen, klen, i * jlen * klen);
+                    // Keep this call sequential to avoid nested rayon parallelism.
+                    self.build_grids(&mut grid_a, &mut grid_b, jlen, klen, i * jlen * klen, false);
 
                     // Extrapolate grid_a and grid_b from {0,1}^window_size to {0,1,∞}^window_size.
                     MultiquadraticPolynomial::<F>::expand_linear_grid_to_multiquadratic(
@@ -499,7 +547,8 @@ impl<F: JoltField, S: StreamingSchedule> OuterRemainingSumcheckProver<F, S> {
         let klen = 1 << split_eq_poly.num_challenges();
         let mut ret_az = vec![F::zero(); jlen];
         let mut ret_bz = vec![F::zero(); jlen];
-        self.build_grids(&mut ret_az, &mut ret_bz, jlen, klen, 0);
+        // Parallelize over j for the linear-time conversion.
+        self.build_grids(&mut ret_az, &mut ret_bz, jlen, klen, 0, true);
         self.az = Some(DensePolynomial::new(ret_az));
         self.bz = Some(DensePolynomial::new(ret_bz));
     }
