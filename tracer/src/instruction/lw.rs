@@ -44,6 +44,13 @@ impl LW {
     }
 }
 
+#[tracer_macros::gen_exec]
+impl LW {
+    fn ast() -> Stmt {
+        WriteRd(Sext { from: W32, to: W64, expr: Load(W32, Add(Rs1, Imm)) })
+    }
+}
+
 impl RISCVTrace for LW {
     fn trace(&self, cpu: &mut Cpu, trace: Option<&mut Vec<Cycle>>) {
         let inline_sequence = self.inline_sequence(&cpu.vr_allocator, cpu.xlen);

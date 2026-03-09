@@ -26,6 +26,8 @@ keywords = ["SNARK", "cryptography", "proofs"]
 members = [
     "jolt-core",
     "tracer",
+    "tracer-macros",
+    "scripts/extract-fn",
     "common",
     "jolt-platform",
     "jolt-sdk",

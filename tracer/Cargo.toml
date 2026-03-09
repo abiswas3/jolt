@@ -50,6 +50,7 @@ strum.workspace = true
 rand = { workspace = true, optional = true }
 paste.workspace = true
 itertools.workspace = true
+tracer-macros = { path = "../tracer-macros" }
 tracing-subscriber.workspace = true
 clap.workspace = true
 common = { workspace = true, default-features = false }

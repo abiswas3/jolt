@@ -20,6 +20,7 @@ use emulator::{
 use instruction::{Cycle, Instruction};
 use object::{Object, ObjectSection, SectionKind};
 
+pub mod ast;
 pub mod emulator;
 pub mod instruction;
 pub mod utils;

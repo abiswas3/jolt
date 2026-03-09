@@ -1964,6 +1964,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "extract-fn"
+version = "0.1.0"
+dependencies = [
+ "prettyplease",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "eyre"
 version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5817,8 +5826,18 @@ dependencies = [
  "serde_json",
  "strum 0.28.0",
  "strum_macros 0.28.0",
+ "tracer-macros",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "tracer-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

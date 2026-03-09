@@ -23,4 +23,11 @@ impl ADD {
     }
 }
 
+#[tracer_macros::gen_exec]
+impl ADD {
+    fn ast() -> Stmt {
+        WriteRd(Sext { from: Xlen, to: W64, expr: Add(Rs1, Rs2) })
+    }
+}
+
 impl RISCVTrace for ADD {}
