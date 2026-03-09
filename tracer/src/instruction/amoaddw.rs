@@ -21,7 +21,18 @@ declare_riscv_instr!(
     side_effects = true
 );
 
+#[tracer_macros::gen_exec]
 impl AMOADDW {
+    fn ast() -> Stmt {
+        Seq([
+            LetStmt("orig", Cast { from: W32, to: W64, sign: Signed, expr: Load(W32, Rs1) }),
+            Store(W32, Rs1, Cast { from: W64, to: W32, sign: Unsigned, expr:
+                Add(Var("orig"), Cast { from: W64, to: W32, sign: Signed, expr: Rs2 })
+            }),
+            WriteRd(Var("orig")),
+        ])
+    }
+
     fn exec(&self, cpu: &mut Cpu, _: &mut <AMOADDW as RISCVInstruction>::RAMAccess) {
         let address = cpu.x[self.operands.rs1 as usize] as u64;
         let add_value = cpu.x[self.operands.rs2 as usize] as i32;

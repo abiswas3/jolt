@@ -45,7 +45,10 @@ pub fn gen_exec(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Generate ast_exec method
     let ast_exec_method: ImplItemFn = syn::parse_quote! {
         fn ast_exec(&self, cpu: &mut crate::emulator::cpu::Cpu, ram_access: &mut <#self_ty as crate::instruction::RISCVInstruction>::RAMAccess) {
+            let mut _ram_read_out: Option<crate::instruction::RAMRead> = None;
+            let mut _ram_write_out: Option<crate::instruction::RAMWrite> = None;
             #exec_body
+            crate::instruction::assign_ram_access(ram_access, _ram_read_out, _ram_write_out);
         }
     };
 
@@ -130,7 +133,7 @@ fn generate_stmt(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                         "W64" => quote! { cpu.mmu.store_doubleword(#addr as u64, #val as u64).ok().unwrap() },
                         _ => return Err(syn::Error::new_spanned(width, "unsupported Store width")),
                     };
-                    Ok(quote! { *ram_access = #store_call; })
+                    Ok(quote! { _ram_write_out = Some(#store_call); })
                 }
                 "WritePc" => {
                     if call.args.len() != 1 {
@@ -293,8 +296,8 @@ fn generate_expr(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                         _ => return Err(syn::Error::new_spanned(&call.args[0], "unsupported Load width")),
                     };
                     Ok(quote! { {
-                        let (val, mem_read) = #load_call;
-                        *ram_access = mem_read;
+                        let (val, _ram_read) = #load_call;
+                        _ram_read_out = Some(_ram_read);
                         val as i64
                     } })
                 }
