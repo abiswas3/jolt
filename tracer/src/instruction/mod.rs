@@ -358,37 +358,6 @@ impl From<()> for RAMAccess {
     }
 }
 
-/// Helper for proc-macro generated code to assign RAM access from optional read/write.
-pub fn assign_ram_access<T: AssignRamAccess>(target: &mut T, read: Option<RAMRead>, write: Option<RAMWrite>) {
-    target.assign(read, write);
-}
-
-pub trait AssignRamAccess {
-    fn assign(&mut self, read: Option<RAMRead>, write: Option<RAMWrite>);
-}
-
-impl AssignRamAccess for RAMRead {
-    fn assign(&mut self, read: Option<RAMRead>, _write: Option<RAMWrite>) {
-        if let Some(r) = read { *self = r; }
-    }
-}
-
-impl AssignRamAccess for RAMWrite {
-    fn assign(&mut self, _read: Option<RAMRead>, write: Option<RAMWrite>) {
-        if let Some(w) = write { *self = w; }
-    }
-}
-
-impl AssignRamAccess for RAMReadWrite {
-    fn assign(&mut self, read: Option<RAMRead>, write: Option<RAMWrite>) {
-        if let Some(r) = read { self.read = r; }
-        if let Some(w) = write { self.write = w; }
-    }
-}
-
-impl AssignRamAccess for () {
-    fn assign(&mut self, _read: Option<RAMRead>, _write: Option<RAMWrite>) {}
-}
 
 #[derive(Default)]
 pub struct NormalizedInstruction {

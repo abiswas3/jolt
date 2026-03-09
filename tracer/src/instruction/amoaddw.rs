@@ -21,7 +21,7 @@ declare_riscv_instr!(
     side_effects = true
 );
 
-#[tracer_macros::gen_exec(ram)]
+#[tracer_macros::gen_exec]
 impl AMOADDW {
     fn ast() -> Stmt {
         Seq([

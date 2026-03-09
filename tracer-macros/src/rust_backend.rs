@@ -71,7 +71,7 @@ fn generate_stmt(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                         "W64" => quote! { cpu.mmu.store_doubleword(#addr as u64, #val as u64).ok().unwrap() },
                         _ => return Err(syn::Error::new_spanned(width, "unsupported Store width")),
                     };
-                    Ok(quote! { _ram_write_out = Some(#store_call); })
+                    Ok(quote! { let _ = #store_call; })
                 }
                 "WritePc" => {
                     if call.args.len() != 1 {
@@ -231,8 +231,7 @@ fn generate_expr(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                         _ => return Err(syn::Error::new_spanned(&call.args[0], "unsupported Load width")),
                     };
                     Ok(quote! { {
-                        let (val, _ram_read) = #load_call;
-                        _ram_read_out = Some(_ram_read);
+                        let (val, _) = #load_call;
                         val as i64
                     } })
                 }
