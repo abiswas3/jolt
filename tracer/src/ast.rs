@@ -8,6 +8,13 @@ pub enum Width {
     Xlen,
 }
 
+/// Signed or unsigned interpretation for type conversions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignMode {
+    Signed,
+    Unsigned,
+}
+
 /// An expression — pure computation, no side effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
@@ -58,12 +65,10 @@ pub enum Expr {
     GeU(Box<Expr>, Box<Expr>),
 
     // Type conversion
-    /// Sign-extend from `from` bits to `to` bits.
-    Sext { from: Width, to: Width, expr: Box<Expr> },
-    /// Zero-extend from `from` bits to `to` bits.
-    Zext { from: Width, to: Width, expr: Box<Expr> },
-    /// Truncate to `to` bits.
-    Trunc(Width, Box<Expr>),
+    /// Explicit cast between widths. Sign mode determines extension behavior
+    /// when `to > from`. When `to <= from` (truncation), sign is irrelevant
+    /// but still required for uniformity.
+    Cast { from: Width, to: Width, sign: SignMode, expr: Box<Expr> },
 
     // Memory
     Load(Width, Box<Expr>),

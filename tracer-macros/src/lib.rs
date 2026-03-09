@@ -278,23 +278,6 @@ fn generate_expr(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                     ((((#a as u64 as u128).wrapping_mul(#b as u64 as u128)) >> 64) as i64)
                 }),
 
-                // Trunc(width, expr)
-                "Trunc" => {
-                    if call.args.len() != 2 {
-                        return Err(syn::Error::new_spanned(call, "Trunc takes 2 arguments"));
-                    }
-                    let width_name = path_ident_name_expr(&call.args[0])?;
-                    let inner = generate_expr(&call.args[1])?;
-                    match width_name.as_str() {
-                        "W8" => Ok(quote! { ((#inner as u8) as i64) }),
-                        "W16" => Ok(quote! { ((#inner as u16) as i64) }),
-                        "W32" => Ok(quote! { ((#inner as u32) as i64) }),
-                        "W64" => Ok(quote! { ((#inner as u64) as i64) }),
-                        "Xlen" => Ok(quote! { (cpu.unsigned_data(#inner) as i64) }),
-                        _ => Err(syn::Error::new_spanned(&call.args[0], "unsupported Trunc width")),
-                    }
-                }
-
                 // Load(width, addr)
                 "Load" => {
                     if call.args.len() != 2 {
@@ -371,12 +354,11 @@ fn generate_expr(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                 _ => Err(syn::Error::new_spanned(call, format!("unknown Expr variant: {}", func_name))),
             }
         }
-        // Struct-style: Sext { from: W32, to: Xlen, expr: ... }
+        // Struct-style: Cast { from: W32, to: W64, sign: Signed, expr: ... }
         Expr::Struct(s) => {
             let name = path_to_string_from_path(&s.path)?;
             match name.as_str() {
-                "Sext" => generate_ext(s, true),
-                "Zext" => generate_ext(s, false),
+                "Cast" => generate_cast(s),
                 "XlenMatch" => {
                     let bit32 = find_struct_field(s, "bit32")?;
                     let bit64 = find_struct_field(s, "bit64")?;
@@ -405,58 +387,53 @@ fn generate_expr(expr: &Expr) -> Result<TokenStream2, syn::Error> {
     }
 }
 
-/// Generate sign-extend or zero-extend code.
-fn generate_ext(s: &ExprStruct, signed: bool) -> Result<TokenStream2, syn::Error> {
+/// Generate code for Cast { from, to, sign, expr }.
+fn generate_cast(s: &ExprStruct) -> Result<TokenStream2, syn::Error> {
     let from = find_struct_field(s, "from")?;
     let to = find_struct_field(s, "to")?;
+    let sign = find_struct_field(s, "sign")?;
     let inner = find_struct_field(s, "expr")?;
 
     let from_name = path_ident_name_expr(from)?;
     let to_name = path_ident_name_expr(to)?;
+    let sign_name = path_ident_name_expr(sign)?;
     let inner_gen = generate_expr(inner)?;
 
-    // Sext from W32 to Xlen = cpu.sign_extend(val)
-    // Sext from W8 to Xlen = val as i8 as i64 (then sign_extend if needed)
-    if to_name == "Xlen" {
-        if signed {
-            match from_name.as_str() {
-                "W8" => Ok(quote! { cpu.sign_extend(#inner_gen as i8 as i64) }),
-                "W16" => Ok(quote! { cpu.sign_extend(#inner_gen as i16 as i64) }),
-                "W32" => Ok(quote! { cpu.sign_extend(#inner_gen as i32 as i64) }),
-                "W64" => Ok(quote! { (#inner_gen) }),
-                "Xlen" => Ok(quote! { cpu.sign_extend(#inner_gen) }),
-                _ => Err(syn::Error::new_spanned(from, "unsupported Sext from width")),
-            }
-        } else {
-            match from_name.as_str() {
-                "W8" => Ok(quote! { ((#inner_gen as u8) as i64) }),
-                "W16" => Ok(quote! { ((#inner_gen as u16) as i64) }),
-                "W32" => Ok(quote! { ((#inner_gen as u32) as i64) }),
-                "W64" => Ok(quote! { ((#inner_gen as u64) as i64) }),
-                "Xlen" => Ok(quote! { (cpu.unsigned_data(#inner_gen) as i64) }),
-                _ => Err(syn::Error::new_spanned(from, "unsupported Zext from width")),
-            }
-        }
-    } else if to_name == "W64" {
-        if signed {
-            match from_name.as_str() {
-                "W8" => Ok(quote! { (#inner_gen as i8 as i64) }),
-                "W16" => Ok(quote! { (#inner_gen as i16 as i64) }),
-                "W32" => Ok(quote! { (#inner_gen as i32 as i64) }),
-                "Xlen" => Ok(quote! { cpu.sign_extend(#inner_gen) }),
-                _ => Err(syn::Error::new_spanned(from, "unsupported Sext to W64")),
-            }
-        } else {
-            match from_name.as_str() {
-                "W8" => Ok(quote! { ((#inner_gen as u8) as i64) }),
-                "W16" => Ok(quote! { ((#inner_gen as u16) as i64) }),
-                "W32" => Ok(quote! { ((#inner_gen as u32) as i64) }),
-                "Xlen" => Ok(quote! { (cpu.unsigned_data(#inner_gen) as i64) }),
-                _ => Err(syn::Error::new_spanned(from, "unsupported Zext to W64")),
-            }
-        }
-    } else {
-        Err(syn::Error::new_spanned(to, "unsupported target width for Sext/Zext"))
+    let signed = match sign_name.as_str() {
+        "Signed" => true,
+        "Unsigned" => false,
+        _ => return Err(syn::Error::new_spanned(sign, "sign must be Signed or Unsigned")),
+    };
+
+    // Narrowing (to <= from): truncation, sign is irrelevant
+    // Widening (to > from): sign determines extend behavior
+    match (from_name.as_str(), to_name.as_str()) {
+        // Truncation to fixed widths
+        (_, "W8") => Ok(quote! { ((#inner_gen as u8) as i64) }),
+        (_, "W16") => Ok(quote! { ((#inner_gen as u16) as i64) }),
+        (_, "W32") if !signed => Ok(quote! { ((#inner_gen as u32) as i64) }),
+        (_, "W32") if signed => Ok(quote! { (#inner_gen as i32 as i64) }),
+        // To W64
+        ("W8", "W64") if signed => Ok(quote! { (#inner_gen as i8 as i64) }),
+        ("W8", "W64") => Ok(quote! { ((#inner_gen as u8) as i64) }),
+        ("W16", "W64") if signed => Ok(quote! { (#inner_gen as i16 as i64) }),
+        ("W16", "W64") => Ok(quote! { ((#inner_gen as u16) as i64) }),
+        ("W32", "W64") if signed => Ok(quote! { (#inner_gen as i32 as i64) }),
+        ("W32", "W64") => Ok(quote! { ((#inner_gen as u32) as i64) }),
+        ("Xlen", "W64") if signed => Ok(quote! { cpu.sign_extend(#inner_gen) }),
+        ("Xlen", "W64") => Ok(quote! { (cpu.unsigned_data(#inner_gen) as i64) }),
+        ("W64", "W64") => Ok(quote! { (#inner_gen) }),
+        // To Xlen
+        ("W8", "Xlen") if signed => Ok(quote! { cpu.sign_extend(#inner_gen as i8 as i64) }),
+        ("W8", "Xlen") => Ok(quote! { ((#inner_gen as u8) as i64) }),
+        ("W16", "Xlen") if signed => Ok(quote! { cpu.sign_extend(#inner_gen as i16 as i64) }),
+        ("W16", "Xlen") => Ok(quote! { ((#inner_gen as u16) as i64) }),
+        ("W32", "Xlen") if signed => Ok(quote! { cpu.sign_extend(#inner_gen as i32 as i64) }),
+        ("W32", "Xlen") => Ok(quote! { ((#inner_gen as u32) as i64) }),
+        ("W64", "Xlen") => Ok(quote! { (#inner_gen) }),
+        ("Xlen", "Xlen") if signed => Ok(quote! { cpu.sign_extend(#inner_gen) }),
+        ("Xlen", "Xlen") => Ok(quote! { (cpu.unsigned_data(#inner_gen) as i64) }),
+        _ => Err(syn::Error::new_spanned(s, format!("unsupported Cast: {} -> {}", from_name, to_name))),
     }
 }
 

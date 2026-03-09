@@ -26,7 +26,7 @@ impl ADD {
 #[tracer_macros::gen_exec]
 impl ADD {
     fn ast() -> Stmt {
-        WriteRd(Sext { from: Xlen, to: W64, expr: Add(Rs1, Rs2) })
+        WriteRd(Cast { from: Xlen, to: W64, sign: Signed, expr: Add(Rs1, Rs2) })
     }
 }
 
