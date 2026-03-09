@@ -44,7 +44,7 @@ impl LW {
     }
 }
 
-#[tracer_macros::gen_exec]
+#[tracer_macros::gen_exec(ram)]
 impl LW {
     fn ast() -> Stmt {
         WriteRd(Cast { from: W32, to: W64, sign: Signed, expr: Load(W32, Add(Rs1, Imm)) })

@@ -45,7 +45,7 @@ impl SW {
     }
 }
 
-#[tracer_macros::gen_exec]
+#[tracer_macros::gen_exec(ram)]
 impl SW {
     fn ast() -> Stmt {
         Store(W32, Add(Rs1, Imm), Rs2)

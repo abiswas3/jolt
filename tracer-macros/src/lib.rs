@@ -12,9 +12,16 @@ use syn::{parse_macro_input, ItemImpl, ImplItem, ImplItemFn};
 /// Reads the `fn ast() -> Stmt` method, and generates a corresponding
 /// `fn ast_exec(&self, cpu: &mut Cpu, ram_access: &mut ...)` method
 /// that executes the same semantics described by the AST.
+///
+/// Usage:
+///   `#[tracer_macros::gen_exec]`      — no RAM access (ram type is `()`)
+///   `#[tracer_macros::gen_exec(ram)]`  — has RAM access (Load/Store scaffolding emitted)
 #[proc_macro_attribute]
-pub fn gen_exec(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn gen_exec(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut impl_block = parse_macro_input!(item as ItemImpl);
+
+    // Parse attribute: `ram` means the instruction uses RAM
+    let has_ram = !attr.is_empty();
 
     // Find the ast() method
     let ast_fn = impl_block.items.iter().find_map(|item| {
@@ -45,13 +52,21 @@ pub fn gen_exec(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Get the type name from the impl block
     let self_ty = &impl_block.self_ty;
 
-    // Generate ast_exec method
-    let ast_exec_method: ImplItemFn = syn::parse_quote! {
-        fn ast_exec(&self, cpu: &mut crate::emulator::cpu::Cpu, ram_access: &mut <#self_ty as crate::instruction::RISCVInstruction>::RAMAccess) {
-            let mut _ram_read_out: Option<crate::instruction::RAMRead> = None;
-            let mut _ram_write_out: Option<crate::instruction::RAMWrite> = None;
-            #exec_body
-            crate::instruction::assign_ram_access(ram_access, _ram_read_out, _ram_write_out);
+    // Only emit RAM scaffolding when the attribute declares RAM access
+    let ast_exec_method: ImplItemFn = if has_ram {
+        syn::parse_quote! {
+            fn ast_exec(&self, cpu: &mut crate::emulator::cpu::Cpu, ram_access: &mut <#self_ty as crate::instruction::RISCVInstruction>::RAMAccess) {
+                let mut _ram_read_out: Option<crate::instruction::RAMRead> = None;
+                let mut _ram_write_out: Option<crate::instruction::RAMWrite> = None;
+                #exec_body
+                crate::instruction::assign_ram_access(ram_access, _ram_read_out, _ram_write_out);
+            }
+        }
+    } else {
+        syn::parse_quote! {
+            fn ast_exec(&self, cpu: &mut crate::emulator::cpu::Cpu, _ram_access: &mut <#self_ty as crate::instruction::RISCVInstruction>::RAMAccess) {
+                #exec_body
+            }
         }
     };
 
