@@ -23,11 +23,11 @@ pub fn generate_exec_body(block: &syn::Block) -> Result<TokenStream2, syn::Error
         _ => return Err(syn::Error::new_spanned(last, "ast() must end with a Stmt expression")),
     };
 
-    generate_stmt(ret_expr)
+    generate_ast_stmt(ret_expr)
 }
 
 /// Generate Rust code from a Stmt AST node.
-fn generate_stmt(expr: &Expr) -> Result<TokenStream2, syn::Error> {
+fn generate_ast_stmt(expr: &Expr) -> Result<TokenStream2, syn::Error> {
     match expr {
         Expr::Call(call) => {
             let func_name = path_ident_name(&call.func)?;
@@ -36,7 +36,7 @@ fn generate_stmt(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                     if call.args.len() != 1 {
                         return Err(syn::Error::new_spanned(call, "WriteRd takes 1 argument"));
                     }
-                    let val = generate_expr(&call.args[0])?;
+                    let val = generate_ast_expr(&call.args[0])?;
                     Ok(quote! {
                         let _rd_val = #val;
                         cpu.write_register(self.operands.rd as usize, _rd_val);
@@ -49,7 +49,7 @@ fn generate_stmt(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                     }
                     match &call.args[0] {
                         Expr::Array(arr) => {
-                            let stmts: Result<Vec<_>, _> = arr.elems.iter().map(|e| generate_stmt(e)).collect();
+                            let stmts: Result<Vec<_>, _> = arr.elems.iter().map(|e| generate_ast_stmt(e)).collect();
                             let stmts = stmts?;
                             Ok(quote! { #(#stmts)* })
                         }
@@ -61,8 +61,8 @@ fn generate_stmt(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                         return Err(syn::Error::new_spanned(call, "Store takes 3 arguments: width, addr, value"));
                     }
                     let width = &call.args[0];
-                    let addr = generate_expr(&call.args[1])?;
-                    let val = generate_expr(&call.args[2])?;
+                    let addr = generate_ast_expr(&call.args[1])?;
+                    let val = generate_ast_expr(&call.args[2])?;
                     let width_name = path_ident_name_expr(width)?;
                     let store_call = match width_name.as_str() {
                         "W8" => quote! { cpu.mmu.store(#addr as u64, #val as u8).ok().unwrap() },
@@ -77,15 +77,15 @@ fn generate_stmt(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                     if call.args.len() != 1 {
                         return Err(syn::Error::new_spanned(call, "WritePc takes 1 argument"));
                     }
-                    let val = generate_expr(&call.args[0])?;
+                    let val = generate_ast_expr(&call.args[0])?;
                     Ok(quote! { cpu.pc = #val as u64; })
                 }
                 "Branch" => {
                     if call.args.len() != 2 {
                         return Err(syn::Error::new_spanned(call, "Branch takes 2 arguments: condition, target"));
                     }
-                    let cond = generate_expr(&call.args[0])?;
-                    let target = generate_expr(&call.args[1])?;
+                    let cond = generate_ast_expr(&call.args[0])?;
+                    let target = generate_ast_expr(&call.args[1])?;
                     Ok(quote! {
                         if #cond != 0 {
                             cpu.pc = #target as u64;
@@ -96,16 +96,16 @@ fn generate_stmt(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                     if call.args.len() != 2 {
                         return Err(syn::Error::new_spanned(call, "Assert takes 2 arguments"));
                     }
-                    let lhs = generate_expr(&call.args[0])?;
-                    let rhs = generate_expr(&call.args[1])?;
+                    let lhs = generate_ast_expr(&call.args[0])?;
+                    let rhs = generate_ast_expr(&call.args[1])?;
                     Ok(quote! { assert_eq!(#lhs, #rhs); })
                 }
                 "WriteReg" => {
                     if call.args.len() != 2 {
                         return Err(syn::Error::new_spanned(call, "WriteReg takes 2 arguments: reg, value"));
                     }
-                    let reg = generate_expr(&call.args[0])?;
-                    let val = generate_expr(&call.args[1])?;
+                    let reg = generate_ast_expr(&call.args[0])?;
+                    let val = generate_ast_expr(&call.args[1])?;
                     Ok(quote! { cpu.write_register(#reg as usize, #val); })
                 }
                 "LetStmt" => {
@@ -119,7 +119,7 @@ fn generate_stmt(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                         },
                         _ => return Err(syn::Error::new_spanned(&call.args[0], "LetStmt name must be a string literal")),
                     };
-                    let val = generate_expr(&call.args[1])?;
+                    let val = generate_ast_expr(&call.args[1])?;
                     Ok(quote! { let #name = #val; })
                 }
                 _ => Err(syn::Error::new_spanned(call, format!("unknown Stmt variant: {}", func_name))),
@@ -138,7 +138,7 @@ fn generate_stmt(expr: &Expr) -> Result<TokenStream2, syn::Error> {
 }
 
 /// Generate a Rust expression from an Expr AST node.
-fn generate_expr(expr: &Expr) -> Result<TokenStream2, syn::Error> {
+fn generate_ast_expr(expr: &Expr) -> Result<TokenStream2, syn::Error> {
     match expr {
         // Terminals: Rs1, Rs2, Imm, Pc, Advice, MostNegative
         Expr::Path(p) => {
@@ -188,7 +188,7 @@ fn generate_expr(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                     if call.args.len() != 1 {
                         return Err(syn::Error::new_spanned(call, "Not takes 1 argument"));
                     }
-                    let a = generate_expr(&call.args[0])?;
+                    let a = generate_ast_expr(&call.args[0])?;
                     Ok(quote! { (!#a) })
                 }
 
@@ -222,7 +222,7 @@ fn generate_expr(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                         return Err(syn::Error::new_spanned(call, "Load takes 2 arguments"));
                     }
                     let width_name = path_ident_name_expr(&call.args[0])?;
-                    let addr = generate_expr(&call.args[1])?;
+                    let addr = generate_ast_expr(&call.args[1])?;
                     let load_call = match width_name.as_str() {
                         "W8" => quote! { cpu.mmu.load(#addr as u64).expect("MMU load error") },
                         "W16" => quote! { cpu.mmu.load_halfword(#addr as u64).expect("MMU load error") },
@@ -241,7 +241,7 @@ fn generate_expr(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                     if call.args.len() != 1 {
                         return Err(syn::Error::new_spanned(call, "TrailingZeros takes 1 argument"));
                     }
-                    let inner = generate_expr(&call.args[0])?;
+                    let inner = generate_ast_expr(&call.args[0])?;
                     Ok(quote! { ((#inner as u64).trailing_zeros() as i64) })
                 }
 
@@ -250,9 +250,9 @@ fn generate_expr(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                     if call.args.len() != 3 {
                         return Err(syn::Error::new_spanned(call, "If takes 3 arguments"));
                     }
-                    let cond = generate_expr(&call.args[0])?;
-                    let then_expr = generate_expr(&call.args[1])?;
-                    let else_expr = generate_expr(&call.args[2])?;
+                    let cond = generate_ast_expr(&call.args[0])?;
+                    let then_expr = generate_ast_expr(&call.args[1])?;
+                    let else_expr = generate_ast_expr(&call.args[2])?;
                     Ok(quote! { if #cond != 0 { #then_expr } else { #else_expr } })
                 }
 
@@ -268,8 +268,8 @@ fn generate_expr(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                         },
                         _ => return Err(syn::Error::new_spanned(&call.args[0], "Let name must be a string literal")),
                     };
-                    let val = generate_expr(&call.args[1])?;
-                    let body = generate_expr(&call.args[2])?;
+                    let val = generate_ast_expr(&call.args[1])?;
+                    let body = generate_ast_expr(&call.args[2])?;
                     Ok(quote! { { let #name = #val; #body } })
                 }
 
@@ -295,12 +295,12 @@ fn generate_expr(expr: &Expr) -> Result<TokenStream2, syn::Error> {
         Expr::Struct(s) => {
             let name = path_to_string_from_path(&s.path)?;
             match name.as_str() {
-                "Cast" => generate_cast(s),
+                "Cast" => generate_ast_cast(s),
                 "XlenMatch" => {
                     let bit32 = find_struct_field(s, "bit32")?;
                     let bit64 = find_struct_field(s, "bit64")?;
-                    let gen32 = generate_expr(bit32)?;
-                    let gen64 = generate_expr(bit64)?;
+                    let gen32 = generate_ast_expr(bit32)?;
+                    let gen64 = generate_ast_expr(bit64)?;
                     Ok(quote! {
                         match cpu.xlen {
                             crate::emulator::cpu::Xlen::Bit32 => #gen32,
@@ -324,7 +324,7 @@ fn generate_expr(expr: &Expr) -> Result<TokenStream2, syn::Error> {
 }
 
 /// Generate code for Cast { from, to, sign, expr }.
-fn generate_cast(s: &ExprStruct) -> Result<TokenStream2, syn::Error> {
+fn generate_ast_cast(s: &ExprStruct) -> Result<TokenStream2, syn::Error> {
     let from = find_struct_field(s, "from")?;
     let to = find_struct_field(s, "to")?;
     let sign = find_struct_field(s, "sign")?;
@@ -333,7 +333,7 @@ fn generate_cast(s: &ExprStruct) -> Result<TokenStream2, syn::Error> {
     let from_name = path_ident_name_expr(from)?;
     let to_name = path_ident_name_expr(to)?;
     let sign_name = path_ident_name_expr(sign)?;
-    let inner_gen = generate_expr(inner)?;
+    let inner_gen = generate_ast_expr(inner)?;
 
     let signed = match sign_name.as_str() {
         "Signed" => true,
@@ -379,7 +379,7 @@ fn binary_op(
     if call.args.len() != 2 {
         return Err(syn::Error::new_spanned(call, "binary op takes 2 arguments"));
     }
-    let a = generate_expr(&call.args[0])?;
-    let b = generate_expr(&call.args[1])?;
+    let a = generate_ast_expr(&call.args[0])?;
+    let b = generate_ast_expr(&call.args[1])?;
     Ok(gen(a, b))
 }

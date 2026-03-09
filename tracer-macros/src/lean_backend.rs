@@ -72,8 +72,8 @@ pub fn generate_lean(name: &str, block: &syn::Block) -> Result<String, syn::Erro
         _ => return Err(syn::Error::new_spanned(last, "ast() must end with a Stmt expression")),
     };
 
-    let mut ctx = LeanCtx { indent: 1 };
-    let body = ctx.generate_stmt(ret_expr)?;
+    let mut ctx = LeanCtx { indent: 1, align_checks: Vec::new() };
+    let body = ctx.generate_ast_stmt(ret_expr)?;
 
     Ok(format!(
         "def {} (rs1 rs2 rd : BitVec 5) (imm : BitVec 12) (s : State) : State :=\n{}",
@@ -81,8 +81,17 @@ pub fn generate_lean(name: &str, block: &syn::Block) -> Result<String, syn::Erro
     ))
 }
 
+/// Collected alignment precondition from a Load or Store in an expression tree.
+struct AlignCheck {
+    addr: String,
+    mask: String,
+}
+
 struct LeanCtx {
     indent: usize,
+    /// Alignment checks collected during expression generation.
+    /// Drained by statement generators to wrap output in guards.
+    align_checks: Vec<AlignCheck>,
 }
 
 impl LeanCtx {
@@ -90,7 +99,25 @@ impl LeanCtx {
         "  ".repeat(self.indent)
     }
 
-    fn generate_stmt(&mut self, expr: &Expr) -> Result<String, syn::Error> {
+    /// Drain collected alignment checks and wrap `body` in `if ... then error else` guards.
+    fn wrap_align_guards(&mut self, body: String) -> String {
+        let checks = std::mem::take(&mut self.align_checks);
+        if checks.is_empty() {
+            return body;
+        }
+        let pad = self.pad();
+        let mut out = String::new();
+        for check in &checks {
+            out.push_str(&format!(
+                "{pad}if ({}) &&& {}#64 ≠ 0#64 then {{ s with error := true }}\n{pad}else\n",
+                check.addr, check.mask
+            ));
+        }
+        out.push_str(&body);
+        out
+    }
+
+    fn generate_ast_stmt(&mut self, expr: &Expr) -> Result<String, syn::Error> {
         match expr {
             Expr::Call(call) => {
                 let func_name = path_ident_name(&call.func)?;
@@ -99,9 +126,10 @@ impl LeanCtx {
                         if call.args.len() != 1 {
                             return Err(syn::Error::new_spanned(call, "WriteRd takes 1 argument"));
                         }
-                        let val = self.generate_expr(&call.args[0])?;
+                        let val = self.generate_ast_expr(&call.args[0])?;
                         let pad = self.pad();
-                        Ok(format!("{pad}let new_reg := write rd ({val}) s.reg\n{pad}{{ s with reg := new_reg }}"))
+                        let body = format!("{pad}let new_reg := write rd ({val}) s.reg\n{pad}{{ s with reg := new_reg }}");
+                        Ok(self.wrap_align_guards(body))
                     }
                     "Nop" => {
                         let pad = self.pad();
@@ -116,7 +144,7 @@ impl LeanCtx {
                                 // Thread state through: each stmt takes s and produces s
                                 // We generate let-chain style
                                 let items: Vec<_> = arr.elems.iter().collect();
-                                self.generate_seq(&items)
+                                self.generate_ast_seq(&items)
                             }
                             _ => Err(syn::Error::new_spanned(&call.args[0], "Seq expects an array literal")),
                         }
@@ -126,8 +154,8 @@ impl LeanCtx {
                             return Err(syn::Error::new_spanned(call, "Store takes 3 arguments"));
                         }
                         let width_name = path_ident_name_expr(&call.args[0])?;
-                        let addr = self.generate_expr(&call.args[1])?;
-                        let val = self.generate_expr(&call.args[2])?;
+                        let addr = self.generate_ast_expr(&call.args[1])?;
+                        let val = self.generate_ast_expr(&call.args[2])?;
                         let pad = self.pad();
                         let sfn = store_fn(&width_name)
                             .map_err(|e| syn::Error::new_spanned(&call.args[0], e))?;
@@ -147,7 +175,7 @@ impl LeanCtx {
                         if call.args.len() != 1 {
                             return Err(syn::Error::new_spanned(call, "WritePc takes 1 argument"));
                         }
-                        let val = self.generate_expr(&call.args[0])?;
+                        let val = self.generate_ast_expr(&call.args[0])?;
                         let pad = self.pad();
                         Ok(format!("{pad}{{ s with pc := ({val}).truncate 64 }}"))
                     }
@@ -155,8 +183,8 @@ impl LeanCtx {
                         if call.args.len() != 2 {
                             return Err(syn::Error::new_spanned(call, "Branch takes 2 arguments"));
                         }
-                        let cond = self.generate_expr(&call.args[0])?;
-                        let target = self.generate_expr(&call.args[1])?;
+                        let cond = self.generate_ast_expr(&call.args[0])?;
+                        let target = self.generate_ast_expr(&call.args[1])?;
                         let pad = self.pad();
                         Ok(format!(
                             "{pad}if {cond} ≠ 0#64 then {{ s with pc := ({target}).truncate 64 }}\n{pad}else s"
@@ -167,18 +195,20 @@ impl LeanCtx {
                             return Err(syn::Error::new_spanned(call, "LetStmt takes 2 arguments"));
                         }
                         let name = extract_string_lit(&call.args[0])?;
-                        let val = self.generate_expr(&call.args[1])?;
+                        let val = self.generate_ast_expr(&call.args[1])?;
                         let pad = self.pad();
-                        Ok(format!("{pad}let {name} := {val}"))
+                        let body = format!("{pad}let {name} := {val}");
+                        Ok(self.wrap_align_guards(body))
                     }
                     "WriteReg" => {
                         if call.args.len() != 2 {
                             return Err(syn::Error::new_spanned(call, "WriteReg takes 2 arguments"));
                         }
-                        let reg = self.generate_expr(&call.args[0])?;
-                        let val = self.generate_expr(&call.args[1])?;
+                        let reg = self.generate_ast_expr(&call.args[0])?;
+                        let val = self.generate_ast_expr(&call.args[1])?;
                         let pad = self.pad();
-                        Ok(format!("{pad}let new_reg := write ({reg}).truncate s.reg ({val})\n{pad}{{ s with reg := new_reg }}"))
+                        let body = format!("{pad}let new_reg := write ({reg}).truncate s.reg ({val})\n{pad}{{ s with reg := new_reg }}");
+                        Ok(self.wrap_align_guards(body))
                     }
                     _ => Err(syn::Error::new_spanned(call, format!("unknown Stmt: {}", func_name))),
                 }
@@ -198,7 +228,7 @@ impl LeanCtx {
 
     /// Generate a sequence of statements threaded through state.
     /// The last statement is the "return", earlier ones are let-bindings on state.
-    fn generate_seq(&mut self, items: &[&Expr]) -> Result<String, syn::Error> {
+    fn generate_ast_seq(&mut self, items: &[&Expr]) -> Result<String, syn::Error> {
         if items.is_empty() {
             let pad = self.pad();
             return Ok(format!("{pad}s"));
@@ -215,7 +245,7 @@ impl LeanCtx {
                 if let Ok(name) = path_ident_name(&call.func) {
                     if name == "LetStmt" {
                         // LetStmt just adds a let binding, doesn't produce new state
-                        let stmt = self.generate_stmt(item)?;
+                        let stmt = self.generate_ast_stmt(item)?;
                         lines.push(stmt);
                         continue;
                     }
@@ -224,11 +254,11 @@ impl LeanCtx {
 
             if is_last {
                 // Last statement produces the final state
-                let stmt = self.generate_stmt(item)?;
+                let stmt = self.generate_ast_stmt(item)?;
                 lines.push(stmt);
             } else {
                 // Intermediate state-modifying statement: bind result to s
-                let stmt = self.generate_stmt(item)?;
+                let stmt = self.generate_ast_stmt(item)?;
                 lines.push(format!("{pad}let s :="));
                 self.indent += 1;
                 lines.push(self.reindent_stmt(&stmt));
@@ -240,12 +270,12 @@ impl LeanCtx {
     }
 
     fn reindent_stmt(&self, _stmt: &str) -> String {
-        // Stmt is already indented from generate_stmt; just return as-is
-        // since generate_stmt uses self.pad() at current indent level
+        // Stmt is already indented from generate_ast_stmt; just return as-is
+        // since generate_ast_stmt uses self.pad() at current indent level
         _stmt.to_string()
     }
 
-    fn generate_expr(&self, expr: &Expr) -> Result<String, syn::Error> {
+    fn generate_ast_expr(&mut self, expr: &Expr) -> Result<String, syn::Error> {
         match expr {
             Expr::Path(p) => {
                 let name = path_to_string(p)?;
@@ -274,52 +304,52 @@ impl LeanCtx {
                     "Or" => self.lean_binop(&call.args, "|||"),
                     "Xor" => self.lean_binop(&call.args, "^^^"),
                     "Sll" => {
-                        let a = self.generate_expr(&call.args[0])?;
-                        let b = self.generate_expr(&call.args[1])?;
+                        let a = self.generate_ast_expr(&call.args[0])?;
+                        let b = self.generate_ast_expr(&call.args[1])?;
                         Ok(format!("{a} <<< {b}"))
                     }
                     "Srl" => {
-                        let a = self.generate_expr(&call.args[0])?;
-                        let b = self.generate_expr(&call.args[1])?;
+                        let a = self.generate_ast_expr(&call.args[0])?;
+                        let b = self.generate_ast_expr(&call.args[1])?;
                         Ok(format!("{a} >>> {b}"))
                     }
                     "Sra" => {
-                        let a = self.generate_expr(&call.args[0])?;
-                        let b = self.generate_expr(&call.args[1])?;
+                        let a = self.generate_ast_expr(&call.args[0])?;
+                        let b = self.generate_ast_expr(&call.args[1])?;
                         Ok(format!("BitVec.sshiftRight {a} {b}.toNat"))
                     }
                     "Eq" => {
-                        let a = self.generate_expr(&call.args[0])?;
-                        let b = self.generate_expr(&call.args[1])?;
+                        let a = self.generate_ast_expr(&call.args[0])?;
+                        let b = self.generate_ast_expr(&call.args[1])?;
                         Ok(format!("if {a} = {b} then 1#64 else 0#64"))
                     }
                     "Ne" => {
-                        let a = self.generate_expr(&call.args[0])?;
-                        let b = self.generate_expr(&call.args[1])?;
+                        let a = self.generate_ast_expr(&call.args[0])?;
+                        let b = self.generate_ast_expr(&call.args[1])?;
                         Ok(format!("if {a} ≠ {b} then 1#64 else 0#64"))
                     }
                     "Lt" => {
-                        let a = self.generate_expr(&call.args[0])?;
-                        let b = self.generate_expr(&call.args[1])?;
+                        let a = self.generate_ast_expr(&call.args[0])?;
+                        let b = self.generate_ast_expr(&call.args[1])?;
                         Ok(format!("if BitVec.slt {a} {b} then 1#64 else 0#64"))
                     }
                     "LtU" => {
-                        let a = self.generate_expr(&call.args[0])?;
-                        let b = self.generate_expr(&call.args[1])?;
+                        let a = self.generate_ast_expr(&call.args[0])?;
+                        let b = self.generate_ast_expr(&call.args[1])?;
                         Ok(format!("if BitVec.ult {a} {b} then 1#64 else 0#64"))
                     }
                     "Ge" => {
-                        let a = self.generate_expr(&call.args[0])?;
-                        let b = self.generate_expr(&call.args[1])?;
+                        let a = self.generate_ast_expr(&call.args[0])?;
+                        let b = self.generate_ast_expr(&call.args[1])?;
                         Ok(format!("if ¬ BitVec.slt {a} {b} then 1#64 else 0#64"))
                     }
                     "GeU" => {
-                        let a = self.generate_expr(&call.args[0])?;
-                        let b = self.generate_expr(&call.args[1])?;
+                        let a = self.generate_ast_expr(&call.args[0])?;
+                        let b = self.generate_ast_expr(&call.args[1])?;
                         Ok(format!("if ¬ BitVec.ult {a} {b} then 1#64 else 0#64"))
                     }
                     "Not" => {
-                        let a = self.generate_expr(&call.args[0])?;
+                        let a = self.generate_ast_expr(&call.args[0])?;
                         Ok(format!("~~~{a}"))
                     }
                     "Load" => {
@@ -327,18 +357,24 @@ impl LeanCtx {
                             return Err(syn::Error::new_spanned(call, "Load takes 2 arguments"));
                         }
                         let width_name = path_ident_name_expr(&call.args[0])?;
-                        let addr = self.generate_expr(&call.args[1])?;
+                        let addr = self.generate_ast_expr(&call.args[1])?;
                         let lfn = load_fn(&width_name)
                             .map_err(|e| syn::Error::new_spanned(&call.args[0], e))?;
+                        if let Some(mask) = alignment_mask(&width_name) {
+                            self.align_checks.push(AlignCheck {
+                                addr: addr.clone(),
+                                mask: mask.to_string(),
+                            });
+                        }
                         Ok(format!("{lfn} ({addr}) s"))
                     }
                     "If" => {
                         if call.args.len() != 3 {
                             return Err(syn::Error::new_spanned(call, "If takes 3 arguments"));
                         }
-                        let cond = self.generate_expr(&call.args[0])?;
-                        let then_e = self.generate_expr(&call.args[1])?;
-                        let else_e = self.generate_expr(&call.args[2])?;
+                        let cond = self.generate_ast_expr(&call.args[0])?;
+                        let then_e = self.generate_ast_expr(&call.args[1])?;
+                        let else_e = self.generate_ast_expr(&call.args[2])?;
                         Ok(format!("if {cond} ≠ 0#64 then {then_e} else {else_e}"))
                     }
                     "Var" => {
@@ -351,7 +387,7 @@ impl LeanCtx {
             Expr::Struct(s) => {
                 let name = path_to_string_from_path(&s.path)?;
                 match name.as_str() {
-                    "Cast" => self.generate_cast(s),
+                    "Cast" => self.generate_ast_cast(s),
                     _ => Err(syn::Error::new_spanned(s, format!("unknown struct Expr: {}", name))),
                 }
             }
@@ -362,16 +398,16 @@ impl LeanCtx {
         }
     }
 
-    fn lean_binop(&self, args: &syn::punctuated::Punctuated<Expr, syn::token::Comma>, op: &str) -> Result<String, syn::Error> {
+    fn lean_binop(&mut self, args: &syn::punctuated::Punctuated<Expr, syn::token::Comma>, op: &str) -> Result<String, syn::Error> {
         if args.len() != 2 {
             return Err(syn::Error::new_spanned(&args[0], "binary op takes 2 arguments"));
         }
-        let a = self.generate_expr(&args[0])?;
-        let b = self.generate_expr(&args[1])?;
+        let a = self.generate_ast_expr(&args[0])?;
+        let b = self.generate_ast_expr(&args[1])?;
         Ok(format!("{a} {op} {b}"))
     }
 
-    fn generate_cast(&self, s: &ExprStruct) -> Result<String, syn::Error> {
+    fn generate_ast_cast(&mut self, s: &ExprStruct) -> Result<String, syn::Error> {
         let from = find_struct_field(s, "from")?;
         let to = find_struct_field(s, "to")?;
         let sign = find_struct_field(s, "sign")?;
@@ -380,7 +416,7 @@ impl LeanCtx {
         let from_name = path_ident_name_expr(from)?;
         let to_name = path_ident_name_expr(to)?;
         let sign_name = path_ident_name_expr(sign)?;
-        let inner_gen = self.generate_expr(inner)?;
+        let inner_gen = self.generate_ast_expr(inner)?;
 
         let signed = sign_name == "Signed";
 

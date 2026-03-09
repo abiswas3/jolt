@@ -17,7 +17,7 @@ pub enum SignMode {
 
 /// An expression — pure computation, no side effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Expr {
+pub enum AstExpr {
     // Terminals
     Rs1,
     Rs2,
@@ -31,83 +31,83 @@ pub enum Expr {
     MostNegative,
 
     // Arithmetic
-    Add(Box<Expr>, Box<Expr>),
-    Sub(Box<Expr>, Box<Expr>),
-    Mul(Box<Expr>, Box<Expr>),
+    Add(Box<AstExpr>, Box<AstExpr>),
+    Sub(Box<AstExpr>, Box<AstExpr>),
+    Mul(Box<AstExpr>, Box<AstExpr>),
     /// Upper bits of signed × signed multiplication.
-    MulHigh(Box<Expr>, Box<Expr>),
+    MulHigh(Box<AstExpr>, Box<AstExpr>),
     /// Upper bits of signed × unsigned multiplication.
-    MulHighSU(Box<Expr>, Box<Expr>),
+    MulHighSU(Box<AstExpr>, Box<AstExpr>),
     /// Upper bits of unsigned × unsigned multiplication.
-    MulHighU(Box<Expr>, Box<Expr>),
-    Div(Box<Expr>, Box<Expr>),
-    DivU(Box<Expr>, Box<Expr>),
-    Rem(Box<Expr>, Box<Expr>),
-    RemU(Box<Expr>, Box<Expr>),
+    MulHighU(Box<AstExpr>, Box<AstExpr>),
+    Div(Box<AstExpr>, Box<AstExpr>),
+    DivU(Box<AstExpr>, Box<AstExpr>),
+    Rem(Box<AstExpr>, Box<AstExpr>),
+    RemU(Box<AstExpr>, Box<AstExpr>),
 
     // Bitwise
-    And(Box<Expr>, Box<Expr>),
-    Or(Box<Expr>, Box<Expr>),
-    Xor(Box<Expr>, Box<Expr>),
-    Not(Box<Expr>),
+    And(Box<AstExpr>, Box<AstExpr>),
+    Or(Box<AstExpr>, Box<AstExpr>),
+    Xor(Box<AstExpr>, Box<AstExpr>),
+    Not(Box<AstExpr>),
 
     // Shifts
-    Sll(Box<Expr>, Box<Expr>),
-    Srl(Box<Expr>, Box<Expr>),
-    Sra(Box<Expr>, Box<Expr>),
+    Sll(Box<AstExpr>, Box<AstExpr>),
+    Srl(Box<AstExpr>, Box<AstExpr>),
+    Sra(Box<AstExpr>, Box<AstExpr>),
 
     // Comparison
-    Eq(Box<Expr>, Box<Expr>),
-    Ne(Box<Expr>, Box<Expr>),
-    Lt(Box<Expr>, Box<Expr>),
-    LtU(Box<Expr>, Box<Expr>),
-    Ge(Box<Expr>, Box<Expr>),
-    GeU(Box<Expr>, Box<Expr>),
+    Eq(Box<AstExpr>, Box<AstExpr>),
+    Ne(Box<AstExpr>, Box<AstExpr>),
+    Lt(Box<AstExpr>, Box<AstExpr>),
+    LtU(Box<AstExpr>, Box<AstExpr>),
+    Ge(Box<AstExpr>, Box<AstExpr>),
+    GeU(Box<AstExpr>, Box<AstExpr>),
 
     // Type conversion
     /// Explicit cast between widths. Sign mode determines extension behavior
     /// when `to > from`. When `to <= from` (truncation), sign is irrelevant
     /// but still required for uniformity.
-    Cast { from: Width, to: Width, sign: SignMode, expr: Box<Expr> },
+    Cast { from: Width, to: Width, sign: SignMode, expr: Box<AstExpr> },
 
     // Memory
-    Load(Width, Box<Expr>),
+    Load(Width, Box<AstExpr>),
 
     // Unary
-    TrailingZeros(Box<Expr>),
+    TrailingZeros(Box<AstExpr>),
 
     // Conditional
-    If(Box<Expr>, Box<Expr>, Box<Expr>),
+    If(Box<AstExpr>, Box<AstExpr>, Box<AstExpr>),
 
     // Xlen-dependent value
     /// Select between two expressions based on xlen.
-    XlenMatch { bit32: Box<Expr>, bit64: Box<Expr> },
+    XlenMatch { bit32: Box<AstExpr>, bit64: Box<AstExpr> },
 
     // Local binding
     /// Bind a named intermediate value.
-    Let(String, Box<Expr>, Box<Expr>),
+    Let(String, Box<AstExpr>, Box<AstExpr>),
     /// Reference a named intermediate value.
     Var(String),
 }
 
 /// A statement — has side effects on CPU state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Stmt {
+pub enum AstStmt {
     /// Write to the instruction's destination register.
-    WriteRd(Expr),
+    WriteRd(AstExpr),
     /// Write to an arbitrary register by index.
-    WriteReg(u8, Expr),
+    WriteReg(u8, AstExpr),
     /// Store to memory: width, address, value.
-    Store(Width, Expr, Expr),
+    Store(Width, AstExpr, AstExpr),
     /// Set PC to expression.
-    WritePc(Expr),
+    WritePc(AstExpr),
     /// Conditional branch: if condition is true, set PC to target.
-    Branch(Expr, Expr),
+    Branch(AstExpr, AstExpr),
     /// Assert two expressions are equal (Lean: Prop, Rust: assert_eq!).
-    Assert(Expr, Expr),
+    Assert(AstExpr, AstExpr),
     /// Sequence of statements.
-    Seq(Vec<Stmt>),
+    Seq(Vec<AstStmt>),
     /// Bind a named value for use in subsequent statements.
-    LetStmt(String, Expr),
+    LetStmt(String, AstExpr),
     Nop,
 }
