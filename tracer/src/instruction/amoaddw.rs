@@ -25,7 +25,8 @@ declare_riscv_instr!(
 impl AMOADDW {
     fn ast() -> Stmt {
         Seq([
-            LetStmt("orig", Cast { from: W32, to: W64, sign: Signed, expr: Load(W32, Rs1) }),
+            Load("raw", W32, Rs1),
+            LetStmt("orig", Cast { from: W32, to: W64, sign: Signed, expr: Var("raw") }),
             Store(W32, Rs1, Cast { from: W64, to: W32, sign: Unsigned, expr:
                 Add(Var("orig"), Cast { from: W64, to: W32, sign: Signed, expr: Rs2 })
             }),

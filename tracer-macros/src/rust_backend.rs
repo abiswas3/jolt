@@ -71,7 +71,9 @@ fn generate_ast_stmt(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                         "W64" => quote! { cpu.mmu.store_doubleword(#addr as u64, #val as u64).ok().unwrap() },
                         _ => return Err(syn::Error::new_spanned(width, "unsupported Store width")),
                     };
-                    Ok(quote! { let _ = #store_call; })
+                    Ok(quote! {
+                        crate::instruction::RecordWrite::record_write(_ram_access, #store_call);
+                    })
                 }
                 "WritePc" => {
                     if call.args.len() != 1 {
@@ -121,6 +123,32 @@ fn generate_ast_stmt(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                     };
                     let val = generate_ast_expr(&call.args[1])?;
                     Ok(quote! { let #name = #val; })
+                }
+                "Load" => {
+                    if call.args.len() != 3 {
+                        return Err(syn::Error::new_spanned(call, "Load takes 3 arguments: name, width, addr"));
+                    }
+                    let name = match &call.args[0] {
+                        Expr::Lit(lit) => match &lit.lit {
+                            syn::Lit::Str(s) => syn::Ident::new(&s.value(), s.span()),
+                            _ => return Err(syn::Error::new_spanned(&call.args[0], "Load name must be a string literal")),
+                        },
+                        _ => return Err(syn::Error::new_spanned(&call.args[0], "Load name must be a string literal")),
+                    };
+                    let width_name = path_ident_name_expr(&call.args[1])?;
+                    let addr = generate_ast_expr(&call.args[2])?;
+                    let load_call = match width_name.as_str() {
+                        "W8" => quote! { cpu.mmu.load(#addr as u64).expect("MMU load error") },
+                        "W16" => quote! { cpu.mmu.load_halfword(#addr as u64).expect("MMU load error") },
+                        "W32" => quote! { cpu.mmu.load_word(#addr as u64).expect("MMU load error") },
+                        "W64" => quote! { cpu.mmu.load_doubleword(#addr as u64).expect("MMU load error") },
+                        _ => return Err(syn::Error::new_spanned(&call.args[1], "unsupported Load width")),
+                    };
+                    Ok(quote! {
+                        let (#name, _ram_read) = #load_call;
+                        crate::instruction::RecordRead::record_read(_ram_access, _ram_read);
+                        let #name = #name as i64;
+                    })
                 }
                 _ => Err(syn::Error::new_spanned(call, format!("unknown Stmt variant: {}", func_name))),
             }
@@ -215,26 +243,6 @@ fn generate_ast_expr(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                 "MulHighU" => binary_op(call, |a, b| quote! {
                     ((((#a as u64 as u128).wrapping_mul(#b as u64 as u128)) >> 64) as i64)
                 }),
-
-                // Load(width, addr)
-                "Load" => {
-                    if call.args.len() != 2 {
-                        return Err(syn::Error::new_spanned(call, "Load takes 2 arguments"));
-                    }
-                    let width_name = path_ident_name_expr(&call.args[0])?;
-                    let addr = generate_ast_expr(&call.args[1])?;
-                    let load_call = match width_name.as_str() {
-                        "W8" => quote! { cpu.mmu.load(#addr as u64).expect("MMU load error") },
-                        "W16" => quote! { cpu.mmu.load_halfword(#addr as u64).expect("MMU load error") },
-                        "W32" => quote! { cpu.mmu.load_word(#addr as u64).expect("MMU load error") },
-                        "W64" => quote! { cpu.mmu.load_doubleword(#addr as u64).expect("MMU load error") },
-                        _ => return Err(syn::Error::new_spanned(&call.args[0], "unsupported Load width")),
-                    };
-                    Ok(quote! { {
-                        let (val, _) = #load_call;
-                        val as i64
-                    } })
-                }
 
                 // TrailingZeros(expr)
                 "TrailingZeros" => {

@@ -70,9 +70,6 @@ pub enum AstExpr {
     /// but still required for uniformity.
     Cast { from: Width, to: Width, sign: SignMode, expr: Box<AstExpr> },
 
-    // Memory
-    Load(Width, Box<AstExpr>),
-
     // Unary
     TrailingZeros(Box<AstExpr>),
 
@@ -105,6 +102,9 @@ pub enum AstStmt {
     Branch(AstExpr, AstExpr),
     /// Assert two expressions are equal (Lean: Prop, Rust: assert_eq!).
     Assert(AstExpr, AstExpr),
+    /// Load from memory: bind result to named variable (width, address).
+    /// Alignment is checked by backends; misaligned access sets error flag.
+    Load(String, Width, AstExpr),
     /// Sequence of statements.
     Seq(Vec<AstStmt>),
     /// Bind a named value for use in subsequent statements.

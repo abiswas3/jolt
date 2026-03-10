@@ -72,7 +72,7 @@ pub fn generate_lean(name: &str, block: &syn::Block) -> Result<String, syn::Erro
         _ => return Err(syn::Error::new_spanned(last, "ast() must end with a Stmt expression")),
     };
 
-    let mut ctx = LeanCtx { indent: 1, align_checks: Vec::new() };
+    let mut ctx = LeanCtx { indent: 1 };
     let body = ctx.generate_ast_stmt(ret_expr)?;
 
     Ok(format!(
@@ -81,40 +81,13 @@ pub fn generate_lean(name: &str, block: &syn::Block) -> Result<String, syn::Erro
     ))
 }
 
-/// Collected alignment precondition from a Load or Store in an expression tree.
-struct AlignCheck {
-    addr: String,
-    mask: String,
-}
-
 struct LeanCtx {
     indent: usize,
-    /// Alignment checks collected during expression generation.
-    /// Drained by statement generators to wrap output in guards.
-    align_checks: Vec<AlignCheck>,
 }
 
 impl LeanCtx {
     fn pad(&self) -> String {
         "  ".repeat(self.indent)
-    }
-
-    /// Drain collected alignment checks and wrap `body` in `if ... then error else` guards.
-    fn wrap_align_guards(&mut self, body: String) -> String {
-        let checks = std::mem::take(&mut self.align_checks);
-        if checks.is_empty() {
-            return body;
-        }
-        let pad = self.pad();
-        let mut out = String::new();
-        for check in &checks {
-            out.push_str(&format!(
-                "{pad}if ({}) &&& {}#64 ≠ 0#64 then {{ s with error := true }}\n{pad}else\n",
-                check.addr, check.mask
-            ));
-        }
-        out.push_str(&body);
-        out
     }
 
     fn generate_ast_stmt(&mut self, expr: &Expr) -> Result<String, syn::Error> {
@@ -128,8 +101,7 @@ impl LeanCtx {
                         }
                         let val = self.generate_ast_expr(&call.args[0])?;
                         let pad = self.pad();
-                        let body = format!("{pad}let new_reg := write rd ({val}) s.reg\n{pad}{{ s with reg := new_reg }}");
-                        Ok(self.wrap_align_guards(body))
+                        Ok(format!("{pad}let new_reg := write rd ({val}) s.reg\n{pad}{{ s with reg := new_reg }}"))
                     }
                     "Nop" => {
                         let pad = self.pad();
@@ -197,8 +169,25 @@ impl LeanCtx {
                         let name = extract_string_lit(&call.args[0])?;
                         let val = self.generate_ast_expr(&call.args[1])?;
                         let pad = self.pad();
-                        let body = format!("{pad}let {name} := {val}");
-                        Ok(self.wrap_align_guards(body))
+                        Ok(format!("{pad}let {name} := {val}"))
+                    }
+                    "Load" => {
+                        if call.args.len() != 3 {
+                            return Err(syn::Error::new_spanned(call, "Load takes 3 arguments: name, width, addr"));
+                        }
+                        let name = extract_string_lit(&call.args[0])?;
+                        let width_name = path_ident_name_expr(&call.args[1])?;
+                        let addr = self.generate_ast_expr(&call.args[2])?;
+                        let lfn = load_fn(&width_name)
+                            .map_err(|e| syn::Error::new_spanned(&call.args[1], e))?;
+                        let pad = self.pad();
+                        // Alignment check inline, same as Store
+                        let align = if let Some(mask) = alignment_mask(&width_name) {
+                            format!("{pad}if ({addr}) &&& {mask}#64 ≠ 0#64 then {{ s with error := true }}\n{pad}else\n")
+                        } else {
+                            String::new()
+                        };
+                        Ok(format!("{align}{pad}let {name} := {lfn} ({addr}) s"))
                     }
                     "WriteReg" => {
                         if call.args.len() != 2 {
@@ -207,8 +196,7 @@ impl LeanCtx {
                         let reg = self.generate_ast_expr(&call.args[0])?;
                         let val = self.generate_ast_expr(&call.args[1])?;
                         let pad = self.pad();
-                        let body = format!("{pad}let new_reg := write ({reg}).truncate s.reg ({val})\n{pad}{{ s with reg := new_reg }}");
-                        Ok(self.wrap_align_guards(body))
+                        Ok(format!("{pad}let new_reg := write ({reg}).truncate s.reg ({val})\n{pad}{{ s with reg := new_reg }}"))
                     }
                     _ => Err(syn::Error::new_spanned(call, format!("unknown Stmt: {}", func_name))),
                 }
@@ -240,11 +228,10 @@ impl LeanCtx {
         for (i, item) in items.iter().enumerate() {
             let is_last = i == items.len() - 1;
 
-            // Check if this is a LetStmt — these just bind a value, don't update state
+            // Check if this is a LetStmt or Load — these just bind a value, don't produce new state
             if let Expr::Call(call) = item {
                 if let Ok(name) = path_ident_name(&call.func) {
-                    if name == "LetStmt" {
-                        // LetStmt just adds a let binding, doesn't produce new state
+                    if name == "LetStmt" || name == "Load" {
                         let stmt = self.generate_ast_stmt(item)?;
                         lines.push(stmt);
                         continue;
@@ -275,7 +262,7 @@ impl LeanCtx {
         _stmt.to_string()
     }
 
-    fn generate_ast_expr(&mut self, expr: &Expr) -> Result<String, syn::Error> {
+    fn generate_ast_expr(&self, expr: &Expr) -> Result<String, syn::Error> {
         match expr {
             Expr::Path(p) => {
                 let name = path_to_string(p)?;
@@ -352,22 +339,6 @@ impl LeanCtx {
                         let a = self.generate_ast_expr(&call.args[0])?;
                         Ok(format!("~~~{a}"))
                     }
-                    "Load" => {
-                        if call.args.len() != 2 {
-                            return Err(syn::Error::new_spanned(call, "Load takes 2 arguments"));
-                        }
-                        let width_name = path_ident_name_expr(&call.args[0])?;
-                        let addr = self.generate_ast_expr(&call.args[1])?;
-                        let lfn = load_fn(&width_name)
-                            .map_err(|e| syn::Error::new_spanned(&call.args[0], e))?;
-                        if let Some(mask) = alignment_mask(&width_name) {
-                            self.align_checks.push(AlignCheck {
-                                addr: addr.clone(),
-                                mask: mask.to_string(),
-                            });
-                        }
-                        Ok(format!("{lfn} ({addr}) s"))
-                    }
                     "If" => {
                         if call.args.len() != 3 {
                             return Err(syn::Error::new_spanned(call, "If takes 3 arguments"));
@@ -398,7 +369,7 @@ impl LeanCtx {
         }
     }
 
-    fn lean_binop(&mut self, args: &syn::punctuated::Punctuated<Expr, syn::token::Comma>, op: &str) -> Result<String, syn::Error> {
+    fn lean_binop(&self, args: &syn::punctuated::Punctuated<Expr, syn::token::Comma>, op: &str) -> Result<String, syn::Error> {
         if args.len() != 2 {
             return Err(syn::Error::new_spanned(&args[0], "binary op takes 2 arguments"));
         }
@@ -407,7 +378,7 @@ impl LeanCtx {
         Ok(format!("{a} {op} {b}"))
     }
 
-    fn generate_ast_cast(&mut self, s: &ExprStruct) -> Result<String, syn::Error> {
+    fn generate_ast_cast(&self, s: &ExprStruct) -> Result<String, syn::Error> {
         let from = find_struct_field(s, "from")?;
         let to = find_struct_field(s, "to")?;
         let sign = find_struct_field(s, "sign")?;

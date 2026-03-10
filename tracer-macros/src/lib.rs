@@ -13,9 +13,8 @@ use syn::{parse_macro_input, ItemImpl, ImplItem, ImplItemFn};
 /// `fn ast_exec(&self, cpu: &mut Cpu, ram_access: &mut ...)` method
 /// that executes the same semantics described by the AST.
 ///
-/// The generated method captures CPU state changes only (registers, memory, PC).
-/// RAM access tracking is tracing infrastructure, not instruction semantics,
-/// so ast_exec does not populate ram_access.
+/// The generated method captures CPU state changes (registers, memory, PC)
+/// and records RAM access via `RecordRead`/`RecordWrite` traits.
 #[proc_macro_attribute]
 pub fn gen_exec(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut impl_block = parse_macro_input!(item as ItemImpl);

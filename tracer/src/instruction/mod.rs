@@ -358,6 +358,41 @@ impl From<()> for RAMAccess {
     }
 }
 
+/// Record a memory read into whatever RAM access type this instruction uses.
+pub trait RecordRead {
+    fn record_read(&mut self, read: RAMRead);
+}
+
+impl RecordRead for RAMRead {
+    fn record_read(&mut self, read: RAMRead) { *self = read; }
+}
+impl RecordRead for RAMReadWrite {
+    fn record_read(&mut self, read: RAMRead) { self.read = read; }
+}
+impl RecordRead for RAMWrite {
+    fn record_read(&mut self, _: RAMRead) {}
+}
+impl RecordRead for () {
+    fn record_read(&mut self, _: RAMRead) {}
+}
+
+/// Record a memory write into whatever RAM access type this instruction uses.
+pub trait RecordWrite {
+    fn record_write(&mut self, write: RAMWrite);
+}
+
+impl RecordWrite for RAMWrite {
+    fn record_write(&mut self, write: RAMWrite) { *self = write; }
+}
+impl RecordWrite for RAMReadWrite {
+    fn record_write(&mut self, write: RAMWrite) { self.write = write; }
+}
+impl RecordWrite for RAMRead {
+    fn record_write(&mut self, _: RAMWrite) {}
+}
+impl RecordWrite for () {
+    fn record_write(&mut self, _: RAMWrite) {}
+}
 
 #[derive(Default)]
 pub struct NormalizedInstruction {
@@ -380,7 +415,7 @@ pub trait RISCVInstruction:
     const MATCH: u32;
 
     type Format: InstructionFormat;
-    type RAMAccess: Default + Into<RAMAccess> + Copy + std::fmt::Debug;
+    type RAMAccess: Default + Into<RAMAccess> + Copy + std::fmt::Debug + RecordRead + RecordWrite;
 
     fn operands(&self) -> &Self::Format;
     fn new(word: u32, address: u64, validate: bool, compressed: bool) -> Self;
