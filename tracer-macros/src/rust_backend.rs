@@ -17,13 +17,27 @@ pub fn generate_exec_body(block: &syn::Block) -> Result<TokenStream2, syn::Error
         return Err(syn::Error::new_spanned(block, "ast() body is empty"));
     }
 
-    let last = stmts.last().unwrap();
-    let ret_expr = match last {
-        syn::Stmt::Expr(expr, _) => expr,
-        _ => return Err(syn::Error::new_spanned(last, "ast() must end with a Stmt expression")),
-    };
+    let mut parts = Vec::new();
+    for stmt in stmts {
+        match stmt {
+            syn::Stmt::Local(local) => {
+                let name = &local.pat;
+                let init = local.init.as_ref()
+                    .ok_or_else(|| syn::Error::new_spanned(local, "let binding must have an initializer"))?;
+                let val = generate_ast_expr(&init.expr)?;
+                parts.push(quote! { let #name = #val; });
+            }
+            syn::Stmt::Expr(expr, Some(_semi)) => {
+                parts.push(generate_ast_stmt(expr)?);
+            }
+            syn::Stmt::Expr(expr, None) => {
+                parts.push(generate_ast_stmt(expr)?);
+            }
+            _ => return Err(syn::Error::new_spanned(stmt, "unsupported statement in ast() body")),
+        }
+    }
 
-    generate_ast_stmt(ret_expr)
+    Ok(quote! { #(#parts)* })
 }
 
 /// Generate Rust code from a Stmt AST node.
@@ -178,7 +192,11 @@ fn generate_ast_expr(expr: &Expr) -> Result<TokenStream2, syn::Error> {
                 "Pc" => Ok(quote! { (cpu.pc as i64) }),
                 "Advice" => Ok(quote! { (self.advice as i64) }),
                 "MostNegative" => Ok(quote! { cpu.most_negative() }),
-                _ => Err(syn::Error::new_spanned(p, format!("unknown terminal: {}", name))),
+                _ => {
+                    // Pass through as a Rust variable reference (e.g. from a let binding)
+                    let ident = syn::Ident::new(&name, p.path.segments[0].ident.span());
+                    Ok(quote! { #ident })
+                }
             }
         }
         // Function-style calls: Add(a, b), Lit(42), Reg(5), etc.

@@ -352,9 +352,6 @@ pub trait RecordRead {
 impl RecordRead for RAMRead {
     fn record_read(&mut self, read: RAMRead) { *self = read; }
 }
-impl RecordRead for RAMReadWrite {
-    fn record_read(&mut self, read: RAMRead) { self.read = read; }
-}
 impl RecordRead for RAMWrite {
     fn record_read(&mut self, _: RAMRead) {}
 }
@@ -369,9 +366,6 @@ pub trait RecordWrite {
 
 impl RecordWrite for RAMWrite {
     fn record_write(&mut self, write: RAMWrite) { *self = write; }
-}
-impl RecordWrite for RAMReadWrite {
-    fn record_write(&mut self, write: RAMWrite) { self.write = write; }
 }
 impl RecordWrite for RAMRead {
     fn record_write(&mut self, _: RAMWrite) {}

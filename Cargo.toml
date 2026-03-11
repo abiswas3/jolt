@@ -28,6 +28,7 @@ members = [
     "tracer",
     "tracer-macros",
     "scripts/extract-fn",
+    "scripts/gen-lean",
     "common",
     "jolt-platform",
     "jolt-sdk",

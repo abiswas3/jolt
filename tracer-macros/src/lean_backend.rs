@@ -66,15 +66,32 @@ pub fn generate_lean(name: &str, block: &syn::Block) -> Result<String, syn::Erro
         return Err(syn::Error::new_spanned(block, "ast() body is empty"));
     }
 
-    let last = stmts.last().unwrap();
-    let ret_expr = match last {
-        syn::Stmt::Expr(expr, _) => expr,
-        _ => return Err(syn::Error::new_spanned(last, "ast() must end with a Stmt expression")),
-    };
-
     let mut ctx = LeanCtx { indent: 1 };
-    let body = ctx.generate_ast_stmt(ret_expr)?;
+    let mut parts = Vec::new();
+    for stmt in stmts {
+        match stmt {
+            syn::Stmt::Local(local) => {
+                let pat_name = match &local.pat {
+                    syn::Pat::Ident(pi) => pi.ident.to_string(),
+                    _ => return Err(syn::Error::new_spanned(&local.pat, "only simple let bindings supported")),
+                };
+                let init = local.init.as_ref()
+                    .ok_or_else(|| syn::Error::new_spanned(local, "let binding must have an initializer"))?;
+                let val = ctx.generate_ast_expr(&init.expr)?;
+                let pad = ctx.pad();
+                parts.push(format!("{pad}let {pat_name} := {val}"));
+            }
+            syn::Stmt::Expr(expr, Some(_semi)) => {
+                parts.push(ctx.generate_ast_stmt(expr)?);
+            }
+            syn::Stmt::Expr(expr, None) => {
+                parts.push(ctx.generate_ast_stmt(expr)?);
+            }
+            _ => return Err(syn::Error::new_spanned(stmt, "unsupported statement in ast() body")),
+        }
+    }
 
+    let body = parts.join("\n");
     Ok(format!(
         "def {} (rs1 rs2 rd : BitVec 5) (imm : BitVec 12) (s : State) : State :=\n{}",
         name, body
@@ -271,7 +288,8 @@ impl LeanCtx {
                     "Rs2" => Ok("read rs2 s.reg".to_string()),
                     "Imm" => Ok("imm.signExtend 64".to_string()),
                     "Pc" => Ok("s.pc".to_string()),
-                    _ => Err(syn::Error::new_spanned(p, format!("unknown terminal: {}", name))),
+                    // Pass through as a Lean variable reference (e.g. from a let binding)
+                    _ => Ok(name),
                 }
             }
             Expr::Call(call) => {
